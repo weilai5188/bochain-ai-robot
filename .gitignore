@@ -18,3 +18,20 @@ main/mmap_generate_emoji.h
 *.bin
 mmap_generate_*.h
 .clangd
+
+# ESP-IDF build outputs
+build/
+build2/
+build-*/
+managed_components/
+dependencies.lock
+
+# Local env/cache
+.vscode/
+.idea/
+*.log
+
+# ESP-IDF build outputs
+build/
+build2/
+build-*/

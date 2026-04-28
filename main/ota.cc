@@ -49,6 +49,8 @@ std::string Ota::GetCheckVersionUrl() {
     if (url.empty()) {
         url = CONFIG_OTA_URL;
     }
+
+    ESP_LOGW(TAG, "OTA request url: %s", url.c_str());
     return url;
 }
 
@@ -67,7 +69,6 @@ std::unique_ptr<Http> Ota::SetupHttp() {
     http->SetHeader("User-Agent", user_agent);
     http->SetHeader("Accept-Language", Lang::CODE);
     http->SetHeader("Content-Type", "application/json");
-	ESP_LOGW(TAG, "OTA request url: %s", url.c_str());
 	ESP_LOGW(TAG, "OTA request User-Agent: %s", user_agent.c_str());
     return http;
 }

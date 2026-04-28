@@ -67,7 +67,8 @@ std::unique_ptr<Http> Ota::SetupHttp() {
     http->SetHeader("User-Agent", user_agent);
     http->SetHeader("Accept-Language", Lang::CODE);
     http->SetHeader("Content-Type", "application/json");
-
+	ESP_LOGW(TAG, "OTA request url: %s", url.c_str());
+	ESP_LOGW(TAG, "OTA request User-Agent: %s", user_agent.c_str());
     return http;
 }
 
@@ -106,8 +107,10 @@ esp_err_t Ota::CheckVersion() {
         return status_code;
     }
 
-    data = http->ReadAll();
-    http->Close();
+	data = http->ReadAll();
+	http->Close();
+
+	ESP_LOGW(TAG, "OTA response body: %s", data.c_str());
 
     // Response: { "firmware": { "version": "1.0.0", "url": "http://" } }
     // Parse the JSON response and check if the version is newer

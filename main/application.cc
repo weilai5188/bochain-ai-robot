@@ -9,6 +9,7 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include "bochain_bypass_client.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -260,6 +261,11 @@ void Application::Run() {
 
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
+
+    // 铂链旁路通道：只负责直播弹幕/场控推送，不影响原小智官方聊天链路。
+    // 小智官方聊天仍然通过 OTA 下发的 websocket 配置运行。
+    BochainBypassClient::GetInstance().Start();
+
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
@@ -284,6 +290,9 @@ void Application::HandleNetworkConnectedEvent() {
 }
 
 void Application::HandleNetworkDisconnectedEvent() {
+    // 网络断开时停止铂链旁路连接，网络恢复后会在 HandleNetworkConnectedEvent 中自动重连。
+    BochainBypassClient::GetInstance().Stop();
+
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
     if (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking) {

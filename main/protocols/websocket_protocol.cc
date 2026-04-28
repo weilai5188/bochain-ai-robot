@@ -84,6 +84,14 @@ bool WebsocketProtocol::OpenAudioChannel() {
     Settings settings("websocket", false);
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
+    if (url.empty()) {
+        ESP_LOGE(TAG, "WebSocket url is empty, cannot connect");
+        error_occurred_ = true;
+        if (on_network_error_ != nullptr) {
+            on_network_error_("WebSocket地址为空，请检查OTA配置");
+        }
+        return false;
+    }	
     int version = settings.GetInt("version");
     if (version != 0) {
         version_ = version;

@@ -7,6 +7,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <web_socket.h>
+#include <cJSON.h>
 
 class BochainBypassClient {
 public:
@@ -27,8 +28,12 @@ private:
     void Run();
     bool ConnectOnce(const std::string& url);
     void SendHello();
+    void SendPong();
     void HandleTextMessage(const char* data, size_t len);
+    void HandleBindCodeMessage(cJSON* root);
     void HandleSpeakText(const std::string& text);
+    void DisplayBypassText(const std::string& text, int duration_ms);
+    void SpeakBindCodeDigits(const std::string& code, const std::string& display_text);
     void LoadSettings();
     std::vector<std::string> BuildCandidateUrls() const;
 
@@ -40,6 +45,9 @@ private:
     std::string current_url_;
     std::string device_id_;
     std::string token_;
+    std::string latest_bind_code_;
+    std::string latest_bind_prompt_;
+    bool speak_bind_code_ = true;
 };
 
 #endif // _BOCHAIN_BYPASS_CLIENT_H_

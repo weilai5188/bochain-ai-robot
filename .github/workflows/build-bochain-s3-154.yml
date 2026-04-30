@@ -1,0 +1,93 @@
+name: Build BoChain Xiaozhi ESP32-S3 1.54 ST7789
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/bochain-bypass-ws
+      - main
+    paths:
+      - 'main/**'
+      - 'components/**'
+      - 'managed_components/**'
+      - 'partitions/**'
+      - 'sdkconfig.defaults*'
+      - '.github/workflows/build-bochain-s3-154.yml'
+
+jobs:
+  build:
+    name: Build merged firmware bin
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:release-v5.4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure and build
+        shell: bash
+        run: |
+          set -e
+          . /opt/esp/idf/export.sh
+
+          echo "ESP-IDF version:"
+          idf.py --version
+
+          # Force a clean config so CI always builds the target board/screen.
+          rm -f sdkconfig
+
+          # Use the official project defaults, ESP32-S3 defaults, and our fixed board defaults.
+          DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.bochain-s3-154"
+
+          idf.py set-target esp32s3
+          idf.py -DSDKCONFIG_DEFAULTS="$DEFAULTS" reconfigure
+
+          echo "===== Selected board / LCD config ====="
+          grep -E "CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI_LCD|CONFIG_LCD_ST7789_240X240|CONFIG_IDF_TARGET" sdkconfig || true
+
+          idf.py -DSDKCONFIG_DEFAULTS="$DEFAULTS" build
+
+          # Create one full factory flashing image at offset 0x0.
+          # This avoids flashing bootloader/partition/app/ota bins separately.
+          idf.py -DSDKCONFIG_DEFAULTS="$DEFAULTS" merge-bin
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -e
+          mkdir -p artifacts
+
+          # ESP-IDF merge-bin output name differs across versions, so collect all likely merged bins.
+          find build -maxdepth 2 -type f \( -name '*merged*.bin' -o -name 'merged-binary.bin' \) -print -exec cp {} artifacts/bochain-xiaozhi-s3-st7789-154-merged.bin \;
+
+          # Also keep original build outputs for debugging/OTA use.
+          cp -f build/*.bin artifacts/ 2>/dev/null || true
+          cp -f build/bootloader/*.bin artifacts/ 2>/dev/null || true
+          cp -f build/partition_table/*.bin artifacts/ 2>/dev/null || true
+          cp -f build/flasher_args.json artifacts/ 2>/dev/null || true
+          cp -f sdkconfig artifacts/sdkconfig.bochain-s3-154 || true
+
+          cat > artifacts/FLASH_README.txt <<'README'
+          Main file for factory flashing:
+            bochain-xiaozhi-s3-st7789-154-merged.bin
+
+          Flash at offset 0x0:
+            esptool.py --chip esp32s3 --baud 921600 write_flash 0x0 bochain-xiaozhi-s3-st7789-154-merged.bin
+
+          Notes:
+            - The merged bin is for full/factory flashing.
+            - OTA upgrade normally uses the application bin, not the merged bin.
+            - Official Xiaozhi connection is not replaced by this workflow; BoChain bypass is compiled from main/bochain_bypass_client.*.
+          README
+
+          echo "===== Artifacts ====="
+          ls -lh artifacts
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bochain-xiaozhi-s3-st7789-154-firmware
+          path: artifacts/*

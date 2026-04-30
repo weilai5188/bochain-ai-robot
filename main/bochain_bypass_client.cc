@@ -1,5 +1,7 @@
 #include "bochain_bypass_client.h"
 
+#include "application.h"
+#include "assets/lang_config.h"
 #include "board.h"
 #include "settings.h"
 #include "system_info.h"
@@ -15,6 +17,44 @@
 #define DEFAULT_BOCHAIN_DEVICE_ID_PREFIX "BL-ESP32-"
 #define DEFAULT_BOCHAIN_TOKEN "mr.fu875188"
 
+namespace {
+const char* GetJsonString(cJSON* root, const char* key) {
+    cJSON* item = cJSON_GetObjectItem(root, key);
+    return cJSON_IsString(item) ? item->valuestring : nullptr;
+}
+
+std::string FirstJsonString(cJSON* root, const char* const* keys, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        const char* value = GetJsonString(root, keys[i]);
+        if (value != nullptr && value[0] != '\0') {
+            return value;
+        }
+    }
+    return "";
+}
+
+bool IsType(const char* actual, const char* expected) {
+    return actual != nullptr && strcmp(actual, expected) == 0;
+}
+
+void PlayDigitSound(char digit) {
+    auto& audio_service = Application::GetInstance().GetAudioService();
+    switch (digit) {
+        case '0': audio_service.PlaySound(Lang::Sounds::OGG_0); break;
+        case '1': audio_service.PlaySound(Lang::Sounds::OGG_1); break;
+        case '2': audio_service.PlaySound(Lang::Sounds::OGG_2); break;
+        case '3': audio_service.PlaySound(Lang::Sounds::OGG_3); break;
+        case '4': audio_service.PlaySound(Lang::Sounds::OGG_4); break;
+        case '5': audio_service.PlaySound(Lang::Sounds::OGG_5); break;
+        case '6': audio_service.PlaySound(Lang::Sounds::OGG_6); break;
+        case '7': audio_service.PlaySound(Lang::Sounds::OGG_7); break;
+        case '8': audio_service.PlaySound(Lang::Sounds::OGG_8); break;
+        case '9': audio_service.PlaySound(Lang::Sounds::OGG_9); break;
+        default: break;
+    }
+}
+}  // namespace
+
 BochainBypassClient& BochainBypassClient::GetInstance() {
     static BochainBypassClient instance;
     return instance;
@@ -25,6 +65,7 @@ void BochainBypassClient::LoadSettings() {
     configured_url_ = settings.GetString("url", DEFAULT_BOCHAIN_BYPASS_WS_URL);
     token_ = settings.GetString("token", DEFAULT_BOCHAIN_TOKEN);
     device_id_ = settings.GetString("device_id", "");
+    speak_bind_code_ = settings.GetBool("speak_bind_code", true);
     if (device_id_.empty()) {
         device_id_ = std::string(DEFAULT_BOCHAIN_DEVICE_ID_PREFIX) + SystemInfo::GetMacAddress();
     }
@@ -202,10 +243,13 @@ void BochainBypassClient::SendHello() {
     cJSON_AddStringToObject(root, "role", "speaker");
     cJSON_AddStringToObject(root, "device_id", device_id_.c_str());
     cJSON_AddStringToObject(root, "token", token_.c_str());
-    cJSON_AddStringToObject(root, "version", "1.0.0");
+    cJSON_AddStringToObject(root, "version", "1.0.1-bind-code");
     cJSON_AddStringToObject(root, "board_uuid", Board::GetInstance().GetUuid().c_str());
     cJSON_AddStringToObject(root, "mac", SystemInfo::GetMacAddress().c_str());
     cJSON_AddStringToObject(root, "bypass_url", current_url_.c_str());
+    cJSON_AddBoolToObject(root, "support_bind_code", true);
+    cJSON_AddBoolToObject(root, "support_display", true);
+    cJSON_AddBoolToObject(root, "support_digit_voice", true);
 
     char* json = cJSON_PrintUnformatted(root);
     if (json != nullptr) {
@@ -233,32 +277,119 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
         return;
     }
 
-    if (strcmp(type->valuestring, "speak") == 0) {
-        cJSON* text = cJSON_GetObjectItem(root, "text");
-        if (cJSON_IsString(text)) {
-            HandleSpeakText(text->valuestring);
+    const char* message_type = type->valuestring;
+
+    if (IsType(message_type, "bind_code")) {
+        HandleBindCodeMessage(root);
+    } else if (
+        IsType(message_type, "speak") ||
+        IsType(message_type, "display") ||
+        IsType(message_type, "banner") ||
+        IsType(message_type, "text")
+    ) {
+        const char* keys[] = {"text", "display_text", "speak_text", "message", "content"};
+        std::string text = FirstJsonString(root, keys, sizeof(keys) / sizeof(keys[0]));
+        if (!text.empty()) {
+            HandleSpeakText(text);
         } else {
-            ESP_LOGW(TAG, "speak message missing text");
+            ESP_LOGW(TAG, "%s message missing text", message_type);
         }
-    } else if (strcmp(type->valuestring, "audio") == 0) {
+    } else if (IsType(message_type, "bind_success")) {
+        latest_bind_code_.clear();
+        latest_bind_prompt_.clear();
+        const char* success_keys[] = {"text", "message", "display_text"};
+        std::string success_text = FirstJsonString(root, success_keys, sizeof(success_keys) / sizeof(success_keys[0]));
+        if (success_text.empty()) {
+            success_text = "设备绑定成功，已经归属到当前账号。";
+        }
+        HandleSpeakText(success_text);
+    } else if (IsType(message_type, "audio")) {
         cJSON* url = cJSON_GetObjectItem(root, "url");
         if (cJSON_IsString(url)) {
             ESP_LOGI(TAG, "audio url received, reserved for next version: %s", url->valuestring);
         }
-    } else if (strcmp(type->valuestring, "ping") == 0) {
-        if (websocket_ && websocket_->IsConnected()) {
-            websocket_->Send("{\"type\":\"pong\"}");
-        }
-    } else if (strcmp(type->valuestring, "pong") == 0) {
+    } else if (IsType(message_type, "ping")) {
+        SendPong();
+    } else if (IsType(message_type, "pong")) {
         ESP_LOGD(TAG, "pong");
     } else {
-        ESP_LOGW(TAG, "Unhandled message type: %s", type->valuestring);
+        ESP_LOGW(TAG, "Unhandled message type: %s", message_type);
     }
 
     cJSON_Delete(root);
 }
 
+void BochainBypassClient::HandleBindCodeMessage(cJSON* root) {
+    const char* display_keys[] = {"display_text", "text", "message", "speak_text"};
+    std::string display_text = FirstJsonString(root, display_keys, sizeof(display_keys) / sizeof(display_keys[0]));
+    const char* code_keys[] = {"code", "bind_code"};
+    std::string code = FirstJsonString(root, code_keys, sizeof(code_keys) / sizeof(code_keys[0]));
+    const char* speak_keys[] = {"speak_text", "text", "display_text"};
+    std::string speak_text = FirstJsonString(root, speak_keys, sizeof(speak_keys) / sizeof(speak_keys[0]));
+
+    latest_bind_code_ = code;
+    latest_bind_prompt_ = speak_text;
+
+    if (display_text.empty() && !code.empty()) {
+        display_text = "绑定码：" + code;
+    }
+    if (display_text.empty()) {
+        display_text = "设备已连接旁路，请在后台绑定设备。";
+    }
+
+    ESP_LOGI(TAG, "bind code received: code=%s, display=%s", code.c_str(), display_text.c_str());
+    DisplayBypassText(display_text, 15000);
+
+    if (speak_bind_code_ && !code.empty()) {
+        SpeakBindCodeDigits(code, display_text);
+    }
+}
+
 void BochainBypassClient::HandleSpeakText(const std::string& text) {
-    // 第一版先只打印，确认真机旁路链路跑通后，再接入音频播放/TTS逻辑。
-    ESP_LOGI(TAG, "speak text: %s", text.c_str());
+    ESP_LOGI(TAG, "speak/display text: %s", text.c_str());
+    DisplayBypassText(text, 5000);
+}
+
+void BochainBypassClient::DisplayBypassText(const std::string& text, int duration_ms) {
+    auto& app = Application::GetInstance();
+    app.Schedule([message = text, duration_ms]() {
+        auto display = Board::GetInstance().GetDisplay();
+        if (display != nullptr) {
+            display->SetChatMessage("system", message.c_str());
+            display->ShowNotification(message.c_str(), duration_ms);
+        }
+    });
+}
+
+void BochainBypassClient::SpeakBindCodeDigits(const std::string& code, const std::string& display_text) {
+    auto& app = Application::GetInstance();
+    app.Schedule([code, display_text]() {
+        auto display = Board::GetInstance().GetDisplay();
+        if (display != nullptr) {
+            display->SetChatMessage("system", display_text.c_str());
+        }
+
+        // 不走小智官方 TTS，不影响官方对话链路。这里复用固件内置数字音频，保证无屏幕版本也能听到绑定码。
+        for (char digit : code) {
+            PlayDigitSound(digit);
+        }
+    });
+}
+
+void BochainBypassClient::SendPong() {
+    if (websocket_ == nullptr || !websocket_->IsConnected()) {
+        return;
+    }
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "pong");
+    cJSON_AddStringToObject(root, "device_id", device_id_.c_str());
+    cJSON_AddStringToObject(root, "url", current_url_.c_str());
+
+    char* json = cJSON_PrintUnformatted(root);
+    if (json != nullptr) {
+        websocket_->Send(json);
+        cJSON_free(json);
+    }
+    cJSON_Delete(root);
 }

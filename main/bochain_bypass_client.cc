@@ -6,7 +6,8 @@
 #include "display/display.h"
 #include "settings.h"
 #include "system_info.h"
-
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <cJSON.h>
 #include <cstring>
 #include <esp_log.h>
@@ -66,7 +67,7 @@ void BochainBypassClient::LoadSettings() {
     configured_url_ = settings.GetString("url", DEFAULT_BOCHAIN_BYPASS_WS_URL);
     token_ = settings.GetString("token", DEFAULT_BOCHAIN_TOKEN);
     device_id_ = settings.GetString("device_id", "");
-    speak_bind_code_ = settings.GetBool("speak_bind_code", true);
+    speak_bind_code_ = settings.GetBool("speak_bind_code", false);
     if (device_id_.empty()) {
         device_id_ = std::string(DEFAULT_BOCHAIN_DEVICE_ID_PREFIX) + SystemInfo::GetMacAddress();
     }
@@ -321,28 +322,68 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
 }
 
 void BochainBypassClient::HandleBindCodeMessage(cJSON* root) {
-    const char* display_keys[] = {"display_text", "text", "message", "speak_text"};
-    std::string display_text = FirstJsonString(root, display_keys, sizeof(display_keys) / sizeof(display_keys[0]));
     const char* code_keys[] = {"code", "bind_code"};
-    std::string code = FirstJsonString(root, code_keys, sizeof(code_keys) / sizeof(code_keys[0]));
-    const char* speak_keys[] = {"speak_text", "text", "display_text"};
-    std::string speak_text = FirstJsonString(root, speak_keys, sizeof(speak_keys) / sizeof(speak_keys[0]));
+    std::string code;
+
+    for (auto key : code_keys) {
+        const char* value = GetJsonString(root, key);
+        if (value && strlen(value) > 0) {
+            code = value;
+            break;
+        }
+    }
+
+    if (code.empty()) {
+        ESP_LOGW(TAG, "bind_code message missing code");
+        return;
+    }
 
     latest_bind_code_ = code;
-    latest_bind_prompt_ = speak_text;
 
-    if (display_text.empty() && !code.empty()) {
-        display_text = "绑定码：" + code;
+    std::string display_text = "铂链绑定码：" + code;
+    const char* display_from_json = GetJsonString(root, "display_text");
+    if (display_from_json && strlen(display_from_json) > 0) {
+        display_text = display_from_json;
+
+        // 防止屏幕上只显示“绑定码”，和小智官方激活码混淆
+        if (display_text.find("铂链") == std::string::npos) {
+            display_text = "铂链" + display_text;
+        }
     }
-    if (display_text.empty()) {
-        display_text = "设备已连接旁路，请在后台绑定设备。";
-    }
 
-    ESP_LOGI(TAG, "bind code received: code=%s, display=%s", code.c_str(), display_text.c_str());
-    DisplayBypassText(display_text, 15000);
+    ESP_LOGI(TAG, "BoChain bind code cached: %s", code.c_str());
 
-    if (speak_bind_code_ && !code.empty()) {
-        SpeakBindCodeDigits(code, display_text);
+    // 关键优化：
+    // 1. 不立即播报，避免和小智官方激活码混在一起
+    // 2. 不立即抢屏，避免覆盖小智官方激活码
+    // 3. 延迟显示铂链绑定码，只显示，不自动读
+    xTaskCreate(
+        [](void* arg) {
+            std::string* text = static_cast<std::string*>(arg);
+
+            // 给小智官方激活码留出播报/显示时间
+            vTaskDelay(pdMS_TO_TICKS(45000));
+
+            Application::GetInstance().Schedule([message = *text]() {
+                auto display = Board::GetInstance().GetDisplay();
+                if (display) {
+                    display->SetChatMessage("system", message.c_str());
+                    display->ShowNotification(message.c_str(), 10000);
+                }
+            });
+
+            delete text;
+            vTaskDelete(nullptr);
+        },
+        "bochain_bind_delay",
+        4096,
+        new std::string(display_text),
+        3,
+        nullptr
+    );
+
+    if (speak_bind_code_) {
+        ESP_LOGI(TAG, "speak_bind_code is enabled, but auto speak is suppressed during boot bind flow");
     }
 }
 

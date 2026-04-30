@@ -47,7 +47,7 @@ private:
     std::string token_;
     std::string latest_bind_code_;
     std::string latest_bind_prompt_;
-    bool speak_bind_code_ = true;
+    bool speak_bind_code_ = false;
 };
 
 #endif // _BOCHAIN_BYPASS_CLIENT_H_

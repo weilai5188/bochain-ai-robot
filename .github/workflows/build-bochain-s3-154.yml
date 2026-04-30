@@ -26,7 +26,27 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Force LCD board config
+        shell: bash
+        run: |
+          rm -f sdkconfig
+          cat > sdkconfig.defaults.bochain-s3-154 <<'EOF'
+          CONFIG_IDF_TARGET="esp32s3"
 
+          # CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI is not set
+          CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI_LCD=y
+          # CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI_CAM is not set
+          # CONFIG_BOARD_TYPE_BREAD_COMPACT_ML307 is not set
+          # CONFIG_BOARD_TYPE_BREAD_COMPACT_NT26 is not set
+
+          CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+          CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+          CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+          CONFIG_SPIRAM=y
+          CONFIG_SPIRAM_MODE_OCT=y
+          CONFIG_SPIRAM_SPEED_80M=y
+          EOF
       - name: Configure and build
         shell: bash
         run: |
@@ -37,22 +57,33 @@ jobs:
           idf.py --version
 
           # Force a clean config so CI always builds the target board/screen.
-          rm -f sdkconfig
+          rm -f sdkconfig sdkconfig.old
 
-          # Use the official project defaults, ESP32-S3 defaults, and our fixed board defaults.
+          # Use the official project defaults, ESP32-S3 defaults, and our fixed LCD board defaults.
           DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.bochain-s3-154"
 
-          idf.py set-target esp32s3
-          idf.py -DSDKCONFIG_DEFAULTS="$DEFAULTS" reconfigure
+          # Do NOT run "idf.py set-target" here.
+          # set-target may generate sdkconfig before our board defaults are applied.
+          idf.py -DIDF_TARGET=esp32s3 -DSDKCONFIG_DEFAULTS="$DEFAULTS" reconfigure
 
           echo "===== Selected board / LCD config ====="
-          grep -E "CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI_LCD|CONFIG_LCD_ST7789_240X240|CONFIG_IDF_TARGET" sdkconfig || true
+          grep -nE "CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI|CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI_LCD|CONFIG_IDF_TARGET" sdkconfig || true
 
-          idf.py -DSDKCONFIG_DEFAULTS="$DEFAULTS" build
+          if grep -q '^CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI=y' sdkconfig; then
+            echo "ERROR: Wrong board selected: BREAD_COMPACT_WIFI, expected BREAD_COMPACT_WIFI_LCD"
+            exit 1
+          fi
+
+          if ! grep -q '^CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI_LCD=y' sdkconfig; then
+            echo "ERROR: LCD board was not selected"
+            exit 1
+          fi
+
+          idf.py -DIDF_TARGET=esp32s3 -DSDKCONFIG_DEFAULTS="$DEFAULTS" build
 
           # Create one full factory flashing image at offset 0x0.
           # This avoids flashing bootloader/partition/app/ota bins separately.
-          idf.py -DSDKCONFIG_DEFAULTS="$DEFAULTS" merge-bin
+          idf.py -DIDF_TARGET=esp32s3 -DSDKCONFIG_DEFAULTS="$DEFAULTS" merge-bin
 
       - name: Collect artifacts
         shell: bash

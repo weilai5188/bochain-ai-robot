@@ -3,6 +3,7 @@
 #include "application.h"
 #include "assets/lang_config.h"
 #include "board.h"
+#include "display/display.h"
 #include "settings.h"
 #include "system_info.h"
 

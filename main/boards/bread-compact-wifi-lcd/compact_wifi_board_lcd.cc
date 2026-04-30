@@ -8,6 +8,7 @@
 #include "mcp_server.h"
 #include "lamp_controller.h"
 #include "led/single_led.h"
+#include "assets/lang_config.h"
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
@@ -63,6 +64,15 @@ class CompactWifiBoardLCD : public WifiBoard {
 private:
  
     Button boot_button_;
+#if TOUCH_BUTTON_GPIO != GPIO_NUM_NC
+    Button touch_button_;
+#endif
+#if VOLUME_UP_BUTTON_GPIO != GPIO_NUM_NC
+    Button volume_up_button_;
+#endif
+#if VOLUME_DOWN_BUTTON_GPIO != GPIO_NUM_NC
+    Button volume_down_button_;
+#endif
     LcdDisplay* display_;
 
     void InitializeSpi() {
@@ -131,6 +141,49 @@ private:
             }
             app.ToggleChatState();
         });
+
+#if TOUCH_BUTTON_GPIO != GPIO_NUM_NC
+        touch_button_.OnPressDown([this]() {
+            Application::GetInstance().StartListening();
+        });
+        touch_button_.OnPressUp([this]() {
+            Application::GetInstance().StopListening();
+        });
+#endif
+
+#if VOLUME_UP_BUTTON_GPIO != GPIO_NUM_NC
+        volume_up_button_.OnClick([this]() {
+            auto codec = GetAudioCodec();
+            auto volume = codec->output_volume() + 10;
+            if (volume > 100) {
+                volume = 100;
+            }
+            codec->SetOutputVolume(volume);
+            GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
+        });
+
+        volume_up_button_.OnLongPress([this]() {
+            GetAudioCodec()->SetOutputVolume(100);
+            GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
+        });
+#endif
+
+#if VOLUME_DOWN_BUTTON_GPIO != GPIO_NUM_NC
+        volume_down_button_.OnClick([this]() {
+            auto codec = GetAudioCodec();
+            auto volume = codec->output_volume() - 10;
+            if (volume < 0) {
+                volume = 0;
+            }
+            codec->SetOutputVolume(volume);
+            GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
+        });
+
+        volume_down_button_.OnLongPress([this]() {
+            GetAudioCodec()->SetOutputVolume(0);
+            GetDisplay()->ShowNotification(Lang::Strings::MUTED);
+        });
+#endif
     }
 
     // 物联网初始化，添加对 AI 可见设备
@@ -140,7 +193,17 @@ private:
 
 public:
     CompactWifiBoardLCD() :
-        boot_button_(BOOT_BUTTON_GPIO) {
+        boot_button_(BOOT_BUTTON_GPIO)
+#if TOUCH_BUTTON_GPIO != GPIO_NUM_NC
+        , touch_button_(TOUCH_BUTTON_GPIO)
+#endif
+#if VOLUME_UP_BUTTON_GPIO != GPIO_NUM_NC
+        , volume_up_button_(VOLUME_UP_BUTTON_GPIO)
+#endif
+#if VOLUME_DOWN_BUTTON_GPIO != GPIO_NUM_NC
+        , volume_down_button_(VOLUME_DOWN_BUTTON_GPIO)
+#endif
+    {
         InitializeSpi();
         InitializeLcdDisplay();
         InitializeButtons();

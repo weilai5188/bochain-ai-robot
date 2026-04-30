@@ -530,6 +530,13 @@ void Application::InitializeProtocol() {
     protocol_->OnIncomingJson([this, display](const cJSON* root) {
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
+        if (cJSON_IsString(type) &&
+            (strcmp(type->valuestring, "tts") == 0 || strcmp(type->valuestring, "llm") == 0) &&
+            BochainBypassClient::GetInstance().ShouldSuppressXiaozhiResponse()) {
+            ESP_LOGI(TAG, "Suppress Xiaozhi cloud response after local BoChain command: %s", type->valuestring);
+            return;
+        }
+
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
@@ -560,9 +567,14 @@ void Application::InitializeProtocol() {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring)]() {
+                std::string user_text(text->valuestring);
+                bool handled_by_bochain = BochainBypassClient::GetInstance().TryHandleVoiceCommand(user_text);
+                Schedule([display, message = user_text]() {
                     display->SetChatMessage("user", message.c_str());
                 });
+                if (handled_by_bochain) {
+                    ESP_LOGI(TAG, "BoChain handled local voice command, skip further local STT handling");
+                }
             }
         } else if (strcmp(type->valuestring, "llm") == 0) {
             auto emotion = cJSON_GetObjectItem(root, "emotion");

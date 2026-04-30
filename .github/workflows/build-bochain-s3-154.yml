@@ -19,7 +19,7 @@ jobs:
     name: Build merged firmware bin
     runs-on: ubuntu-latest
     container:
-      image: image: espressif/idf:v5.5.2
+      image: espressif/idf:v5.5.2
 
     steps:
       - name: Checkout

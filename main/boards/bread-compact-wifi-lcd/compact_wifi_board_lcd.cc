@@ -16,7 +16,7 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <driver/spi_common.h>
-
+#include <algorithm>
 #if defined(LCD_TYPE_ILI9341_SERIAL)
 #include "esp_lcd_ili9341.h"
 #endif
@@ -154,34 +154,20 @@ private:
 #if VOLUME_UP_BUTTON_GPIO != GPIO_NUM_NC
         volume_up_button_.OnClick([this]() {
             auto codec = GetAudioCodec();
-            auto volume = codec->output_volume() + 10;
-            if (volume > 100) {
-                volume = 100;
-            }
+            auto volume = std::min(codec->output_volume() + 10, 100);
             codec->SetOutputVolume(volume);
-            GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
-        });
-
-        volume_up_button_.OnLongPress([this]() {
-            GetAudioCodec()->SetOutputVolume(100);
-            GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
+            GetDisplay()->ShowNotification("音量: " + std::to_string(volume));
+            ESP_LOGI(TAG, "Volume up button pressed, volume=%d", volume);
         });
 #endif
 
 #if VOLUME_DOWN_BUTTON_GPIO != GPIO_NUM_NC
         volume_down_button_.OnClick([this]() {
             auto codec = GetAudioCodec();
-            auto volume = codec->output_volume() - 10;
-            if (volume < 0) {
-                volume = 0;
-            }
+            auto volume = std::max(codec->output_volume() - 10, 0);
             codec->SetOutputVolume(volume);
-            GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
-        });
-
-        volume_down_button_.OnLongPress([this]() {
-            GetAudioCodec()->SetOutputVolume(0);
-            GetDisplay()->ShowNotification(Lang::Strings::MUTED);
+            GetDisplay()->ShowNotification("音量: " + std::to_string(volume));
+            ESP_LOGI(TAG, "Volume down button pressed, volume=%d", volume);
         });
 #endif
     }

@@ -75,16 +75,24 @@ private:
 #endif
     LcdDisplay* display_;
 
-    void InitializeSpi() {
-        spi_bus_config_t buscfg = {};
-        buscfg.mosi_io_num = DISPLAY_MOSI_PIN;
-        buscfg.miso_io_num = GPIO_NUM_NC;
-        buscfg.sclk_io_num = DISPLAY_CLK_PIN;
-        buscfg.quadwp_io_num = GPIO_NUM_NC;
-        buscfg.quadhd_io_num = GPIO_NUM_NC;
-        buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
-        ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
-    }
+void InitializeSpi() {
+    spi_bus_config_t buscfg = {};
+    buscfg.mosi_io_num = DISPLAY_MOSI_PIN;
+    buscfg.miso_io_num = GPIO_NUM_NC;
+    buscfg.sclk_io_num = DISPLAY_CLK_PIN;
+    buscfg.quadwp_io_num = GPIO_NUM_NC;
+    buscfg.quadhd_io_num = GPIO_NUM_NC;
+    buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
+
+#if defined(BOARD_POWER_OFF_PIN) && BOARD_POWER_OFF_PIN != GPIO_NUM_NC
+    // BoChain expansion board power hold.
+    // Keep GPIO9 low while firmware is running.
+    gpio_set_direction(BOARD_POWER_OFF_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(BOARD_POWER_OFF_PIN, 0);
+    ESP_LOGI(TAG, "Expansion board power hold enabled on GPIO%d", BOARD_POWER_OFF_PIN);
+#endif
+}
 
     void InitializeLcdDisplay() {
         esp_lcd_panel_io_handle_t panel_io = nullptr;

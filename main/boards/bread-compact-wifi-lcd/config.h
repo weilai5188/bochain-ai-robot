@@ -34,10 +34,12 @@
 // GPIO2  = Interrupt / BOOT
 // GPIO38 = Volume +
 // GPIO39 = Volume -
+// GPIO9  = Expansion board power hold / power-off control
 #define BOOT_BUTTON_GPIO        GPIO_NUM_2
 #define TOUCH_BUTTON_GPIO       GPIO_NUM_NC
 #define VOLUME_UP_BUTTON_GPIO   GPIO_NUM_38
 #define VOLUME_DOWN_BUTTON_GPIO GPIO_NUM_39
+#define BOARD_POWER_OFF_PIN     GPIO_NUM_9
 
 
 #define DISPLAY_BACKLIGHT_PIN GPIO_NUM_42

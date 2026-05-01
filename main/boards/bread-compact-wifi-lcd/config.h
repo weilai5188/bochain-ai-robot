@@ -29,10 +29,16 @@
 
 
 #define BUILTIN_LED_GPIO        GPIO_NUM_48
+
+// BoChain expansion board v1
+// GPIO38 = Volume +
+// GPIO39 = Volume -
+// GPIO0  = Interrupt / BOOT
+// GPIO2  = Interrupt / Touch button
 #define BOOT_BUTTON_GPIO        GPIO_NUM_0
-#define TOUCH_BUTTON_GPIO       GPIO_NUM_NC
-#define VOLUME_UP_BUTTON_GPIO   GPIO_NUM_NC
-#define VOLUME_DOWN_BUTTON_GPIO GPIO_NUM_NC
+#define TOUCH_BUTTON_GPIO       GPIO_NUM_2
+#define VOLUME_UP_BUTTON_GPIO   GPIO_NUM_38
+#define VOLUME_DOWN_BUTTON_GPIO GPIO_NUM_39
 
 
 #define DISPLAY_BACKLIGHT_PIN GPIO_NUM_42

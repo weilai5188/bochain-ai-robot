@@ -16,6 +16,9 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <driver/spi_common.h>
+#include <driver/gpio.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <algorithm>
 #if defined(LCD_TYPE_ILI9341_SERIAL)
 #include "esp_lcd_ili9341.h"
@@ -63,16 +66,10 @@ static const gc9a01_lcd_init_cmd_t gc9107_lcd_init_cmds[] = {
 class CompactWifiBoardLCD : public WifiBoard {
 private:
  
-    Button boot_button_;
-#if TOUCH_BUTTON_GPIO != GPIO_NUM_NC
     Button touch_button_;
-#endif
-#if VOLUME_UP_BUTTON_GPIO != GPIO_NUM_NC
+    Button boot_button_;
     Button volume_up_button_;
-#endif
-#if VOLUME_DOWN_BUTTON_GPIO != GPIO_NUM_NC
     Button volume_down_button_;
-#endif
     LcdDisplay* display_;
 
 void InitializeSpi() {
@@ -141,48 +138,54 @@ void InitializeSpi() {
     }
 
     void InitializeButtons() {
-#if VOLUME_UP_BUTTON_GPIO != GPIO_NUM_NC || VOLUME_DOWN_BUTTON_GPIO != GPIO_NUM_NC
-        // BoChain expansion board volume buttons:
-        // use pulldown + active-high trigger.
-        gpio_config_t volume_btn_conf = {};
-        volume_btn_conf.mode = GPIO_MODE_INPUT;
-        volume_btn_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-        volume_btn_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
-        volume_btn_conf.intr_type = GPIO_INTR_DISABLE;
-        volume_btn_conf.pin_bit_mask = 0;
+        // Expansion board boot/interruption button.
+        // GPIO2 uses pull-up and active-low default Button behavior.
+        gpio_config_t io_conf = {};
+        io_conf.mode = GPIO_MODE_INPUT;
+        io_conf.pin_bit_mask = (1ULL << BOOT_BUTTON_GPIO);
+        io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+        io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        io_conf.intr_type = GPIO_INTR_DISABLE;
+        gpio_config(&io_conf);
 
-#if VOLUME_UP_BUTTON_GPIO != GPIO_NUM_NC
-        volume_btn_conf.pin_bit_mask |= (1ULL << VOLUME_UP_BUTTON_GPIO);
-#endif
-
-#if VOLUME_DOWN_BUTTON_GPIO != GPIO_NUM_NC
-        volume_btn_conf.pin_bit_mask |= (1ULL << VOLUME_DOWN_BUTTON_GPIO);
-#endif
-
-        ESP_ERROR_CHECK(gpio_config(&volume_btn_conf));
-        ESP_LOGI(TAG, "Volume buttons configured active-high: up=%d, down=%d",
-                 VOLUME_UP_BUTTON_GPIO, VOLUME_DOWN_BUTTON_GPIO);
-#endif
+        // If the boot/interruption key is held during startup, wait until released.
+        // This avoids false trigger immediately after boot.
+        if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+            while (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+        }
 
         boot_button_.OnClick([this]() {
+            static bool is_first_click = true;
+            if (is_first_click) {
+                is_first_click = false;
+                ESP_LOGI(TAG, "Ignore first boot button click after startup");
+                return;
+            }
+
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
                 return;
             }
+
             app.ToggleChatState();
+            ESP_LOGI(TAG, "Boot/interruption button pressed");
         });
 
-#if TOUCH_BUTTON_GPIO != GPIO_NUM_NC
+        // Touch button is disabled by config now: TOUCH_BUTTON_GPIO = GPIO_NUM_NC.
+        // Keep callbacks here for compatibility if another expansion board enables it later.
         touch_button_.OnPressDown([this]() {
             Application::GetInstance().StartListening();
+            ESP_LOGI(TAG, "Touch button press down");
         });
+
         touch_button_.OnPressUp([this]() {
             Application::GetInstance().StopListening();
+            ESP_LOGI(TAG, "Touch button press up");
         });
-#endif
 
-#if VOLUME_UP_BUTTON_GPIO != GPIO_NUM_NC
         volume_up_button_.OnClick([this]() {
             auto codec = GetAudioCodec();
             auto volume = std::min(codec->output_volume() + 10, 100);
@@ -190,9 +193,13 @@ void InitializeSpi() {
             GetDisplay()->ShowNotification("音量: " + std::to_string(volume));
             ESP_LOGI(TAG, "Volume up button pressed, volume=%d", volume);
         });
-#endif
 
-#if VOLUME_DOWN_BUTTON_GPIO != GPIO_NUM_NC
+        volume_up_button_.OnLongPress([this]() {
+            GetAudioCodec()->SetOutputVolume(100);
+            GetDisplay()->ShowNotification("音量: 100");
+            ESP_LOGI(TAG, "Volume up long press, volume=100");
+        });
+
         volume_down_button_.OnClick([this]() {
             auto codec = GetAudioCodec();
             auto volume = std::max(codec->output_volume() - 10, 0);
@@ -200,7 +207,12 @@ void InitializeSpi() {
             GetDisplay()->ShowNotification("音量: " + std::to_string(volume));
             ESP_LOGI(TAG, "Volume down button pressed, volume=%d", volume);
         });
-#endif
+
+        volume_down_button_.OnLongPress([this]() {
+            GetAudioCodec()->SetOutputVolume(0);
+            GetDisplay()->ShowNotification("静音");
+            ESP_LOGI(TAG, "Volume down long press, volume=0");
+        });
     }
 
     // 物联网初始化，添加对 AI 可见设备
@@ -210,17 +222,10 @@ void InitializeSpi() {
 
 public:
     CompactWifiBoardLCD() :
-        boot_button_(BOOT_BUTTON_GPIO)
-#if TOUCH_BUTTON_GPIO != GPIO_NUM_NC
-        , touch_button_(TOUCH_BUTTON_GPIO)
-#endif
-#if VOLUME_UP_BUTTON_GPIO != GPIO_NUM_NC
-        // Expansion board volume buttons are tested as active-high.
-        , volume_up_button_(VOLUME_UP_BUTTON_GPIO, true)
-#endif
-#if VOLUME_DOWN_BUTTON_GPIO != GPIO_NUM_NC
-        , volume_down_button_(VOLUME_DOWN_BUTTON_GPIO, true)
-#endif
+        touch_button_(TOUCH_BUTTON_GPIO),
+        boot_button_(BOOT_BUTTON_GPIO),
+        volume_up_button_(VOLUME_UP_BUTTON_GPIO),
+        volume_down_button_(VOLUME_DOWN_BUTTON_GPIO)
     {
         InitializeSpi();
         InitializeLcdDisplay();

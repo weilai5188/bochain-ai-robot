@@ -141,6 +141,29 @@ void InitializeSpi() {
     }
 
     void InitializeButtons() {
+#if VOLUME_UP_BUTTON_GPIO != GPIO_NUM_NC || VOLUME_DOWN_BUTTON_GPIO != GPIO_NUM_NC
+        // BoChain expansion board volume buttons:
+        // use pulldown + active-high trigger.
+        gpio_config_t volume_btn_conf = {};
+        volume_btn_conf.mode = GPIO_MODE_INPUT;
+        volume_btn_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+        volume_btn_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
+        volume_btn_conf.intr_type = GPIO_INTR_DISABLE;
+        volume_btn_conf.pin_bit_mask = 0;
+
+#if VOLUME_UP_BUTTON_GPIO != GPIO_NUM_NC
+        volume_btn_conf.pin_bit_mask |= (1ULL << VOLUME_UP_BUTTON_GPIO);
+#endif
+
+#if VOLUME_DOWN_BUTTON_GPIO != GPIO_NUM_NC
+        volume_btn_conf.pin_bit_mask |= (1ULL << VOLUME_DOWN_BUTTON_GPIO);
+#endif
+
+        ESP_ERROR_CHECK(gpio_config(&volume_btn_conf));
+        ESP_LOGI(TAG, "Volume buttons configured active-high: up=%d, down=%d",
+                 VOLUME_UP_BUTTON_GPIO, VOLUME_DOWN_BUTTON_GPIO);
+#endif
+
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
@@ -192,10 +215,11 @@ public:
         , touch_button_(TOUCH_BUTTON_GPIO)
 #endif
 #if VOLUME_UP_BUTTON_GPIO != GPIO_NUM_NC
-        , volume_up_button_(VOLUME_UP_BUTTON_GPIO)
+        // Expansion board volume buttons are tested as active-high.
+        , volume_up_button_(VOLUME_UP_BUTTON_GPIO, true)
 #endif
 #if VOLUME_DOWN_BUTTON_GPIO != GPIO_NUM_NC
-        , volume_down_button_(VOLUME_DOWN_BUTTON_GPIO)
+        , volume_down_button_(VOLUME_DOWN_BUTTON_GPIO, true)
 #endif
     {
         InitializeSpi();

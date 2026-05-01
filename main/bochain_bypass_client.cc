@@ -216,13 +216,13 @@ bool BochainBypassClient::ConnectOnce(const std::string& url) {
     websocket_->SetHeader("Bochain-Token", token_.c_str());
     websocket_->SetHeader("Bochain-Role", "speaker");
 
-    websocket_->OnData([this](const char* data, size_t len, bool binary) {
-        if (binary) {
-            ESP_LOGW(TAG, "Ignore binary message, len=%u", static_cast<unsigned>(len));
-            return;
-        }
-        HandleTextMessage(data, len);
-    });
+	websocket_->OnData([this](const char* data, size_t len, bool binary) {
+		if (binary) {
+			HandleBinaryMessage(data, len);
+			return;
+		}
+		HandleTextMessage(data, len);
+	});
 
     websocket_->OnDisconnected([this]() {
         ESP_LOGW(TAG, "WebSocket disconnected");
@@ -284,12 +284,14 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
 
     const char* message_type = type->valuestring;
 
-    if (IsType(message_type, "bind_code")) {
-        HandleBindCodeMessage(root);
-    } else if (IsType(message_type, "query_bind_code")) {
-        HandleQueryBindCodeMessage(root);
-    } else if (
-        IsType(message_type, "play_audio") ||
+	if (IsType(message_type, "bind_code")) {
+		HandleBindCodeMessage(root);
+	} else if (IsType(message_type, "query_bind_code")) {
+		HandleQueryBindCodeMessage(root);
+	} else if (IsType(message_type, "tts")) {
+		HandleTtsMessage(root);
+	} else if (
+		IsType(message_type, "play_audio") ||
         IsType(message_type, "music") ||
         IsType(message_type, "audio_play")
     ) {
@@ -384,7 +386,94 @@ void BochainBypassClient::HandleQueryBindCodeMessage(cJSON* root) {
     ShowBindCode(speak, "server");
     SendAck("query_bind_code", latest_bind_code_.empty() ? "empty" : "ok", latest_bind_code_.empty() ? "no bind code cached" : "bind code displayed");
 }
+void BochainBypassClient::HandleTtsMessage(cJSON* root) {
+    cJSON* state = cJSON_GetObjectItem(root, "state");
+    if (!cJSON_IsString(state)) {
+        ESP_LOGW(TAG, "tts message missing state");
+        return;
+    }
 
+    const char* state_value = state->valuestring;
+
+    if (strcmp(state_value, "start") == 0) {
+        ESP_LOGI(TAG, "BoChain TTS start");
+        bochain_tts_active_ = true;
+
+        auto& app = Application::GetInstance();
+        app.GetAudioService().ResetDecoder();
+
+        app.Schedule([]() {
+            Application::GetInstance().SetDeviceState(kDeviceStateSpeaking);
+        });
+
+        SendAck("tts", "start", "bochain tts started");
+        return;
+    }
+
+    if (strcmp(state_value, "sentence_start") == 0) {
+        cJSON* text = cJSON_GetObjectItem(root, "text");
+        if (cJSON_IsString(text)) {
+            ESP_LOGI(TAG, "BoChain TTS text: %s", text->valuestring);
+
+            auto& app = Application::GetInstance();
+            app.Schedule([message = std::string(text->valuestring)]() {
+                auto display = Board::GetInstance().GetDisplay();
+                if (display != nullptr) {
+                    display->SetChatMessage("assistant", message.c_str());
+                    display->ShowNotification(message.c_str(), 6000);
+                }
+            });
+        }
+        return;
+    }
+
+    if (
+        strcmp(state_value, "stop") == 0 ||
+        strcmp(state_value, "end") == 0 ||
+        strcmp(state_value, "sentence_end") == 0
+    ) {
+        ESP_LOGI(TAG, "BoChain TTS stop");
+        bochain_tts_active_ = false;
+
+        auto& app = Application::GetInstance();
+        app.Schedule([]() {
+            if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) {
+                Application::GetInstance().SetDeviceState(kDeviceStateIdle);
+            }
+        });
+
+        SendAck("tts", "stop", "bochain tts stopped");
+        return;
+    }
+
+    ESP_LOGW(TAG, "Unhandled tts state: %s", state_value);
+}
+
+void BochainBypassClient::HandleBinaryMessage(const char* data, size_t len) {
+    if (!bochain_tts_active_) {
+        ESP_LOGW(TAG, "Ignore binary message because bochain tts is not active, len=%u", static_cast<unsigned>(len));
+        return;
+    }
+
+    if (data == nullptr || len == 0) {
+        ESP_LOGW(TAG, "Empty binary audio message");
+        return;
+    }
+
+    auto packet = std::make_unique<AudioStreamPacket>();
+    packet->sample_rate = 24000;
+    packet->frame_duration = 60;
+    packet->timestamp = 0;
+    packet->payload.assign(
+        reinterpret_cast<const uint8_t*>(data),
+        reinterpret_cast<const uint8_t*>(data) + len
+    );
+
+    bool ok = Application::GetInstance().GetAudioService().PushPacketToDecodeQueue(std::move(packet), false);
+    if (!ok) {
+        ESP_LOGW(TAG, "Audio decode queue full, drop binary audio len=%u", static_cast<unsigned>(len));
+    }
+}
 void BochainBypassClient::HandlePlayAudioMessage(cJSON* root) {
     const char* url_keys[] = {"audio_url", "url", "src"};
     std::string url = FirstJsonString(root, url_keys, sizeof(url_keys) / sizeof(url_keys[0]));

@@ -4,6 +4,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <cstddef>
+#include <cstdint>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <web_socket.h>
@@ -46,7 +48,13 @@ private:
     void DisplayBypassText(const std::string& text, int duration_ms);
     void SpeakBindCodeDigits(const std::string& code, const std::string& display_text);
     void ShowBindCode(bool speak, const char* source);
+
+    // 发送普通确认消息给铂链服务器
     void SendAck(const char* event, const char* status, const std::string& message);
+
+    // 发送音频解码队列状态给铂链服务器，用于服务器自适应降速
+    void SendAudioStatus(bool queue_full, int drop_count, size_t last_packet_len);
+
     void LoadSettings();
     std::vector<std::string> BuildCandidateUrls() const;
 
@@ -63,6 +71,10 @@ private:
 	bool speak_bind_code_ = false;
 	bool bochain_tts_active_ = false;
 	int64_t suppress_xiaozhi_until_us_ = 0;
+
+    // 音频队列满状态上报限频，避免队列满时疯狂发 JSON
+    int64_t last_audio_status_us_ = 0;
+    int audio_drop_report_count_ = 0;
 };
 
 #endif // _BOCHAIN_BYPASS_CLIENT_H_

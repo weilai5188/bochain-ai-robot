@@ -12,6 +12,8 @@
 #include <cstring>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include "esp_heap_caps.h"
+#include <esp_system.h>
 
 #define TAG "BochainBypass"
 
@@ -256,6 +258,18 @@ void BochainBypassClient::SendHello() {
     cJSON_AddBoolToObject(root, "support_voice_query_bind_code", true);
     cJSON_AddBoolToObject(root, "support_play_audio_command", true);
 
+    // 告诉铂链服务器：本固件支持音频队列状态反馈
+    cJSON_AddBoolToObject(root, "support_audio_status", true);
+
+    // 告诉服务器当前旁路音频实际入队参数
+    // 注意：HandleBinaryMessage 里当前 AudioStreamPacket 使用 sample_rate=24000、frame_duration=60
+    cJSON* audio_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(audio_params, "format", "opus");
+    cJSON_AddNumberToObject(audio_params, "sample_rate", 24000);
+    cJSON_AddNumberToObject(audio_params, "channels", 1);
+    cJSON_AddNumberToObject(audio_params, "frame_duration", 60);
+    cJSON_AddItemToObject(root, "audio_params", audio_params);
+
     char* json = cJSON_PrintUnformatted(root);
     if (json != nullptr) {
         ESP_LOGI(TAG, "Send hello: %s", json);
@@ -395,20 +409,25 @@ void BochainBypassClient::HandleTtsMessage(cJSON* root) {
 
     const char* state_value = state->valuestring;
 
-    if (strcmp(state_value, "start") == 0) {
-        ESP_LOGI(TAG, "BoChain TTS start");
-        bochain_tts_active_ = true;
+if (strcmp(state_value, "start") == 0) {
+    ESP_LOGI(TAG, "BoChain TTS start");
+    bochain_tts_active_ = true;
 
-        auto& app = Application::GetInstance();
-        app.GetAudioService().ResetDecoder();
+    // 新一轮旁路 TTS 开始，重置音频状态上报计数
+    // 避免上一轮累计的 drop_count 影响下一轮自适应流控
+    audio_drop_report_count_ = 0;
+    last_audio_status_us_ = 0;
 
-        app.Schedule([]() {
-            Application::GetInstance().SetDeviceState(kDeviceStateSpeaking);
-        });
+    auto& app = Application::GetInstance();
+    app.GetAudioService().ResetDecoder();
 
-        SendAck("tts", "start", "bochain tts started");
-        return;
-    }
+    app.Schedule([]() {
+        Application::GetInstance().SetDeviceState(kDeviceStateSpeaking);
+    });
+
+    SendAck("tts", "start", "bochain tts started");
+    return;
+}
 
     if (strcmp(state_value, "sentence_start") == 0) {
         cJSON* text = cJSON_GetObjectItem(root, "text");
@@ -460,6 +479,8 @@ void BochainBypassClient::HandleBinaryMessage(const char* data, size_t len) {
         return;
     }
 
+    auto& audio_service = Application::GetInstance().GetAudioService();
+
     auto packet = std::make_unique<AudioStreamPacket>();
     packet->sample_rate = 24000;
     packet->frame_duration = 60;
@@ -469,10 +490,36 @@ void BochainBypassClient::HandleBinaryMessage(const char* data, size_t len) {
         reinterpret_cast<const uint8_t*>(data) + len
     );
 
-    bool ok = Application::GetInstance().GetAudioService().PushPacketToDecodeQueue(std::move(packet), false);
-    if (!ok) {
-        ESP_LOGW(TAG, "Audio decode queue full, drop binary audio len=%u", static_cast<unsigned>(len));
+    /*
+     * 第一轮：非阻塞入队。
+     * 如果队列没满，直接成功，正常播放。
+     */
+    bool ok = audio_service.PushPacketToDecodeQueue(std::move(packet), false);
+    if (ok) {
+        return;
     }
+
+    /*
+     * 队列满了：
+     * 1. 不再直接 drop；
+     * 2. 先向服务器上报 audio_status，让服务器后续自动降速；
+     * 3. 然后重新构造 packet，用 wait=true 阻塞等待队列腾出空间。
+     *
+     * 这样 WebSocket 接收线程会自然形成背压，服务器不会无限猛推。
+     */
+    ESP_LOGW(TAG, "Audio decode queue full, wait and report status, binary audio len=%u", static_cast<unsigned>(len));
+    SendAudioStatus(true, 1, len);
+
+    auto retry_packet = std::make_unique<AudioStreamPacket>();
+    retry_packet->sample_rate = 24000;
+    retry_packet->frame_duration = 60;
+    retry_packet->timestamp = 0;
+    retry_packet->payload.assign(
+        reinterpret_cast<const uint8_t*>(data),
+        reinterpret_cast<const uint8_t*>(data) + len
+    );
+
+    audio_service.PushPacketToDecodeQueue(std::move(retry_packet), true);
 }
 void BochainBypassClient::HandlePlayAudioMessage(cJSON* root) {
     const char* url_keys[] = {"audio_url", "url", "src"};
@@ -544,6 +591,43 @@ void BochainBypassClient::SendAck(const char* event, const char* status, const s
         cJSON_free(json);
     }
     cJSON_Delete(root);
+}
+
+void BochainBypassClient::SendAudioStatus(bool queue_full, int drop_count, size_t last_packet_len) {
+    if (websocket_ == nullptr || !websocket_->IsConnected()) {
+        return;
+    }
+
+    /*
+     * 队列满时可能连续触发很多次。
+     * 这里做限频：500ms 内最多上报一次，避免状态 JSON 反过来挤占音频通道。
+     */
+    int64_t now_us = esp_timer_get_time();
+    audio_drop_report_count_ += drop_count > 0 ? drop_count : 0;
+
+    if (queue_full && last_audio_status_us_ > 0 && (now_us - last_audio_status_us_) < 500000) {
+        return;
+    }
+
+    last_audio_status_us_ = now_us;
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "audio_status");
+    cJSON_AddStringToObject(root, "device_id", device_id_.c_str());
+    cJSON_AddBoolToObject(root, "queue_full", queue_full);
+    cJSON_AddNumberToObject(root, "drop_count", audio_drop_report_count_ > 0 ? audio_drop_report_count_ : drop_count);
+    cJSON_AddNumberToObject(root, "last_packet_len", static_cast<int>(last_packet_len));
+    cJSON_AddNumberToObject(root, "free_sram", static_cast<int>(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+
+    char* json = cJSON_PrintUnformatted(root);
+    if (json != nullptr) {
+        ESP_LOGW(TAG, "Send audio_status: %s", json);
+        websocket_->Send(json);
+        cJSON_free(json);
+    }
+
+    cJSON_Delete(root);
+    audio_drop_report_count_ = 0;
 }
 
 void BochainBypassClient::HandleBindCodeMessage(cJSON* root) {

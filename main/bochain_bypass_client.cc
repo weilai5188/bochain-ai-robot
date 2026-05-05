@@ -186,7 +186,12 @@ void BochainBypassClient::Run() {
         SendHello();
 
         while (!stop_requested_ && websocket_ != nullptr && websocket_->IsConnected()) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            // BoChain V7: while TTS is active, periodically publish receive credits.
+            // This lets the server send only when the device has real capacity.
+            if (bochain_tts_active_) {
+                SendAudioReady(false, 0);
+            }
+            vTaskDelay(pdMS_TO_TICKS(120));
         }
 
         ESP_LOGW(TAG, "Disconnected, will reconnect");
@@ -248,7 +253,7 @@ void BochainBypassClient::SendHello() {
     cJSON_AddStringToObject(root, "role", "speaker");
     cJSON_AddStringToObject(root, "device_id", device_id_.c_str());
     cJSON_AddStringToObject(root, "token", token_.c_str());
-    cJSON_AddStringToObject(root, "version", "1.0.2-bind-query-audio-ack");
+    cJSON_AddStringToObject(root, "version", "1.0.3-bochain-audio-ready-v7");
     cJSON_AddStringToObject(root, "board_uuid", Board::GetInstance().GetUuid().c_str());
     cJSON_AddStringToObject(root, "mac", SystemInfo::GetMacAddress().c_str());
     cJSON_AddStringToObject(root, "bypass_url", current_url_.c_str());
@@ -262,6 +267,8 @@ void BochainBypassClient::SendHello() {
     cJSON_AddBoolToObject(root, "support_audio_status", true);
     cJSON_AddBoolToObject(root, "support_audio_params", true);
     cJSON_AddBoolToObject(root, "support_audio_watermark", true);
+    cJSON_AddBoolToObject(root, "support_audio_ready", true);
+    cJSON_AddStringToObject(root, "audio_flow_control", "credit_v7");
 
     // 告诉服务器当前旁路音频默认入队参数；后续每轮 TTS start 可动态覆盖。
     cJSON* audio_params = cJSON_CreateObject();
@@ -436,9 +443,12 @@ if (strcmp(state_value, "start") == 0) {
     // 避免上一轮累计的 drop_count 影响下一轮自适应流控
     audio_drop_report_count_ = 0;
     last_audio_status_us_ = 0;
+    last_audio_ready_us_ = 0;
+    last_audio_ready_credits_ = -1;
 
     auto& app = Application::GetInstance();
     app.GetAudioService().ResetDecoder();
+    SendAudioReady(true, 0);
 
     app.Schedule([]() {
         Application::GetInstance().SetDeviceState(kDeviceStateSpeaking);
@@ -515,8 +525,10 @@ void BochainBypassClient::HandleBinaryMessage(const char* data, size_t len) {
      */
     bool ok = audio_service.PushPacketToDecodeQueue(std::move(packet), false);
     if (ok) {
-        // BoChain V6: proactive watermark report before queue becomes full.
-        // Report only when downlink queue is >= 60%, so status messages do not flood the WebSocket.
+        // BoChain V7: report current receive credits after every accepted frame, rate-limited inside.
+        SendAudioReady(false, len);
+
+        // Keep V6 status report for compatibility with existing server-side logs.
         int qsize = audio_service.GetDownlinkQueueSize();
         int qcap = audio_service.GetDownlinkQueueCapacity();
         if (qcap > 0 && qsize * 100 >= qcap * 60) {
@@ -526,29 +538,18 @@ void BochainBypassClient::HandleBinaryMessage(const char* data, size_t len) {
     }
 
     /*
-     * 队列满了：
-     * 1. 不再直接 drop；
-     * 2. 先向服务器上报 audio_status，让服务器后续自动降速；
-     * 3. 然后重新构造 packet，用 wait=true 阻塞等待队列腾出空间。
-     *
-     * 这样 WebSocket 接收线程会自然形成背压，服务器不会无限猛推。
+     * BoChain V7: queue is full. Do NOT block the WebSocket receive callback.
+     * Blocking here creates TCP backlog and makes the next seconds even more choppy.
+     * We report zero/low credits immediately and drop this frame; the V7 server should stop
+     * sending until audio_ready advertises capacity again.
      */
-    ESP_LOGW(TAG, "Audio decode queue full, wait and report status, binary audio len=%u", static_cast<unsigned>(len));
+    ESP_LOGW(TAG, "Audio decode queue full, drop current frame and report credits, binary audio len=%u", static_cast<unsigned>(len));
     SendAudioStatus(true, 1, len);
+    SendAudioReady(true, len);
 
-    // 给解码任务一个时间片，避免 WebSocket 接收回调持续占用 CPU。
-    vTaskDelay(pdMS_TO_TICKS(25));
-
-    auto retry_packet = std::make_unique<AudioStreamPacket>();
-    retry_packet->sample_rate = current_audio_sample_rate_;
-    retry_packet->frame_duration = current_audio_frame_duration_ms_;
-    retry_packet->timestamp = 0;
-    retry_packet->payload.assign(
-        reinterpret_cast<const uint8_t*>(data),
-        reinterpret_cast<const uint8_t*>(data) + len
-    );
-
-    audio_service.PushPacketToDecodeQueue(std::move(retry_packet), true);
+    // Give decoder/output task a tiny slice without blocking the socket for a full frame.
+    vTaskDelay(pdMS_TO_TICKS(2));
+    return;
 }
 void BochainBypassClient::HandlePlayAudioMessage(cJSON* root) {
     const char* url_keys[] = {"audio_url", "url", "src"};
@@ -616,6 +617,71 @@ void BochainBypassClient::SendAck(const char* event, const char* status, const s
 
     char* json = cJSON_PrintUnformatted(root);
     if (json != nullptr) {
+        websocket_->Send(json);
+        cJSON_free(json);
+    }
+    cJSON_Delete(root);
+}
+
+void BochainBypassClient::SendAudioReady(bool force, size_t last_packet_len) {
+    if (websocket_ == nullptr || !websocket_->IsConnected()) {
+        return;
+    }
+
+    auto& audio_service = Application::GetInstance().GetAudioService();
+    int decode_queue_size = audio_service.GetDecodeQueueSize();
+    int decode_queue_capacity = audio_service.GetDecodeQueueCapacity();
+    int playback_queue_size = audio_service.GetPlaybackQueueSize();
+    int playback_queue_capacity = audio_service.GetPlaybackQueueCapacity();
+    int queue_size = audio_service.GetDownlinkQueueSize();
+    int queue_capacity = audio_service.GetDownlinkQueueCapacity();
+
+    if (queue_capacity <= 0) {
+        return;
+    }
+
+    int free_slots = queue_capacity - queue_size;
+    if (free_slots < 0) {
+        free_slots = 0;
+    }
+
+    // Keep a small safety reserve so the server does not fill the device to the brim.
+    // credits is an absolute current allowance, not a cumulative counter.
+    int credits = free_slots - 4;
+    if (credits < 0) {
+        credits = 0;
+    }
+    if (credits > 8) {
+        credits = 8;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    if (!force && last_audio_ready_us_ > 0 && (now_us - last_audio_ready_us_) < 120000 && credits == last_audio_ready_credits_) {
+        return;
+    }
+
+    last_audio_ready_us_ = now_us;
+    last_audio_ready_credits_ = credits;
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "audio_ready");
+    cJSON_AddStringToObject(root, "device_id", device_id_.c_str());
+    cJSON_AddStringToObject(root, "flow_control", "credit_v7");
+    cJSON_AddNumberToObject(root, "credits", credits);
+    cJSON_AddNumberToObject(root, "free_slots", free_slots);
+    cJSON_AddNumberToObject(root, "queue_size", queue_size);
+    cJSON_AddNumberToObject(root, "queue_capacity", queue_capacity);
+    cJSON_AddNumberToObject(root, "decode_queue_size", decode_queue_size);
+    cJSON_AddNumberToObject(root, "decode_queue_capacity", decode_queue_capacity);
+    cJSON_AddNumberToObject(root, "playback_queue_size", playback_queue_size);
+    cJSON_AddNumberToObject(root, "playback_queue_capacity", playback_queue_capacity);
+    cJSON_AddNumberToObject(root, "last_packet_len", static_cast<int>(last_packet_len));
+    cJSON_AddNumberToObject(root, "sample_rate", current_audio_sample_rate_);
+    cJSON_AddNumberToObject(root, "frame_duration", current_audio_frame_duration_ms_);
+
+    char* json = cJSON_PrintUnformatted(root);
+    if (json != nullptr) {
+        ESP_LOGI(TAG, "Send audio_ready: %s", json);
         websocket_->Send(json);
         cJSON_free(json);
     }

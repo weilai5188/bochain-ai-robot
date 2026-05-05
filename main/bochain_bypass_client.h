@@ -55,6 +55,9 @@ private:
     // 发送音频解码队列状态给铂链服务器，用于服务器自适应降速
     void SendAudioStatus(bool queue_full, int drop_count, size_t last_packet_len);
 
+    // BoChain V7：设备主动告诉服务器还能接收多少帧，服务器按 credit 发包。
+    void SendAudioReady(bool force = false, size_t last_packet_len = 0);
+
     void LoadSettings();
     std::vector<std::string> BuildCandidateUrls() const;
 
@@ -79,6 +82,10 @@ private:
     // 音频队列满状态上报限频，避免队列满时疯狂发 JSON
     int64_t last_audio_status_us_ = 0;
     int audio_drop_report_count_ = 0;
+
+    // BoChain V7 audio_ready credit flow control.
+    int64_t last_audio_ready_us_ = 0;
+    int last_audio_ready_credits_ = -1;
 };
 
 #endif // _BOCHAIN_BYPASS_CLIENT_H_

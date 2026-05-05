@@ -191,7 +191,7 @@ void BochainBypassClient::Run() {
             if (bochain_tts_active_) {
                 SendAudioReady(false, 0);
             }
-            vTaskDelay(pdMS_TO_TICKS(120));
+            vTaskDelay(pdMS_TO_TICKS(200));
         }
 
         ESP_LOGW(TAG, "Disconnected, will reconnect");
@@ -656,7 +656,7 @@ void BochainBypassClient::SendAudioReady(bool force, size_t last_packet_len) {
     }
 
     int64_t now_us = esp_timer_get_time();
-    if (!force && last_audio_ready_us_ > 0 && (now_us - last_audio_ready_us_) < 120000 && credits == last_audio_ready_credits_) {
+    if (!force && last_audio_ready_us_ > 0 && (now_us - last_audio_ready_us_) < 200000 && credits == last_audio_ready_credits_) {
         return;
     }
 
@@ -681,7 +681,7 @@ void BochainBypassClient::SendAudioReady(bool force, size_t last_packet_len) {
 
     char* json = cJSON_PrintUnformatted(root);
     if (json != nullptr) {
-        ESP_LOGI(TAG, "Send audio_ready: %s", json);
+        ESP_LOGD(TAG, "Send audio_ready: %s", json);
         websocket_->Send(json);
         cJSON_free(json);
     }

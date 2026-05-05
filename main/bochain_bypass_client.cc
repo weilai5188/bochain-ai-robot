@@ -261,6 +261,7 @@ void BochainBypassClient::SendHello() {
     // 告诉铂链服务器：本固件支持音频队列状态反馈
     cJSON_AddBoolToObject(root, "support_audio_status", true);
     cJSON_AddBoolToObject(root, "support_audio_params", true);
+    cJSON_AddBoolToObject(root, "support_audio_watermark", true);
 
     // 告诉服务器当前旁路音频默认入队参数；后续每轮 TTS start 可动态覆盖。
     cJSON* audio_params = cJSON_CreateObject();
@@ -514,6 +515,13 @@ void BochainBypassClient::HandleBinaryMessage(const char* data, size_t len) {
      */
     bool ok = audio_service.PushPacketToDecodeQueue(std::move(packet), false);
     if (ok) {
+        // BoChain V6: proactive watermark report before queue becomes full.
+        // Report only when downlink queue is >= 60%, so status messages do not flood the WebSocket.
+        int qsize = audio_service.GetDownlinkQueueSize();
+        int qcap = audio_service.GetDownlinkQueueCapacity();
+        if (qcap > 0 && qsize * 100 >= qcap * 60) {
+            SendAudioStatus(false, 0, len);
+        }
         return;
     }
 
@@ -626,8 +634,11 @@ void BochainBypassClient::SendAudioStatus(bool queue_full, int drop_count, size_
     int64_t now_us = esp_timer_get_time();
     audio_drop_report_count_ += drop_count > 0 ? drop_count : 0;
 
-    if (queue_full && last_audio_status_us_ > 0 && (now_us - last_audio_status_us_) < 500000) {
-        return;
+    if (last_audio_status_us_ > 0) {
+        int64_t min_interval_us = queue_full ? 500000 : 300000;
+        if ((now_us - last_audio_status_us_) < min_interval_us) {
+            return;
+        }
     }
 
     last_audio_status_us_ = now_us;
@@ -638,6 +649,22 @@ void BochainBypassClient::SendAudioStatus(bool queue_full, int drop_count, size_
     cJSON_AddBoolToObject(root, "queue_full", queue_full);
     cJSON_AddNumberToObject(root, "drop_count", audio_drop_report_count_ > 0 ? audio_drop_report_count_ : drop_count);
     cJSON_AddNumberToObject(root, "last_packet_len", static_cast<int>(last_packet_len));
+
+    auto& audio_service = Application::GetInstance().GetAudioService();
+    int decode_queue_size = audio_service.GetDecodeQueueSize();
+    int decode_queue_capacity = audio_service.GetDecodeQueueCapacity();
+    int playback_queue_size = audio_service.GetPlaybackQueueSize();
+    int playback_queue_capacity = audio_service.GetPlaybackQueueCapacity();
+    int queue_size = audio_service.GetDownlinkQueueSize();
+    int queue_capacity = audio_service.GetDownlinkQueueCapacity();
+
+    cJSON_AddNumberToObject(root, "queue_size", queue_size);
+    cJSON_AddNumberToObject(root, "queue_capacity", queue_capacity);
+    cJSON_AddNumberToObject(root, "decode_queue_size", decode_queue_size);
+    cJSON_AddNumberToObject(root, "decode_queue_capacity", decode_queue_capacity);
+    cJSON_AddNumberToObject(root, "playback_queue_size", playback_queue_size);
+    cJSON_AddNumberToObject(root, "playback_queue_capacity", playback_queue_capacity);
+
     cJSON_AddNumberToObject(root, "free_sram", static_cast<int>(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
     cJSON_AddNumberToObject(root, "sample_rate", current_audio_sample_rate_);
     cJSON_AddNumberToObject(root, "frame_duration", current_audio_frame_duration_ms_);

@@ -517,6 +517,33 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
     return true;
 }
 
+int AudioService::GetDecodeQueueSize() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    return static_cast<int>(audio_decode_queue_.size());
+}
+
+int AudioService::GetDecodeQueueCapacity() {
+    return MAX_DECODE_PACKETS_IN_QUEUE;
+}
+
+int AudioService::GetPlaybackQueueSize() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    return static_cast<int>(audio_playback_queue_.size());
+}
+
+int AudioService::GetPlaybackQueueCapacity() {
+    return MAX_PLAYBACK_TASKS_IN_QUEUE;
+}
+
+int AudioService::GetDownlinkQueueSize() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    return static_cast<int>(audio_decode_queue_.size() + audio_playback_queue_.size());
+}
+
+int AudioService::GetDownlinkQueueCapacity() {
+    return MAX_DECODE_PACKETS_IN_QUEUE + MAX_PLAYBACK_TASKS_IN_QUEUE;
+}
+
 std::unique_ptr<AudioStreamPacket> AudioService::PopPacketFromSendQueue() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     if (audio_send_queue_.empty()) {

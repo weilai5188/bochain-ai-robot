@@ -260,14 +260,14 @@ void BochainBypassClient::SendHello() {
 
     // 告诉铂链服务器：本固件支持音频队列状态反馈
     cJSON_AddBoolToObject(root, "support_audio_status", true);
+    cJSON_AddBoolToObject(root, "support_audio_params", true);
 
-    // 告诉服务器当前旁路音频实际入队参数
-    // 注意：HandleBinaryMessage 里当前 AudioStreamPacket 使用 sample_rate=24000、frame_duration=60
+    // 告诉服务器当前旁路音频默认入队参数；后续每轮 TTS start 可动态覆盖。
     cJSON* audio_params = cJSON_CreateObject();
     cJSON_AddStringToObject(audio_params, "format", "opus");
-    cJSON_AddNumberToObject(audio_params, "sample_rate", 24000);
+    cJSON_AddNumberToObject(audio_params, "sample_rate", current_audio_sample_rate_);
     cJSON_AddNumberToObject(audio_params, "channels", 1);
-    cJSON_AddNumberToObject(audio_params, "frame_duration", 60);
+    cJSON_AddNumberToObject(audio_params, "frame_duration", current_audio_frame_duration_ms_);
     cJSON_AddItemToObject(root, "audio_params", audio_params);
 
     char* json = cJSON_PrintUnformatted(root);
@@ -411,6 +411,24 @@ void BochainBypassClient::HandleTtsMessage(cJSON* root) {
 
 if (strcmp(state_value, "start") == 0) {
     ESP_LOGI(TAG, "BoChain TTS start");
+
+    // 服务端每轮 TTS start 下发真实音频参数，固件按参数入队，不再写死 24k。
+    cJSON* audio_params = cJSON_GetObjectItem(root, "audio_params");
+    if (cJSON_IsObject(audio_params)) {
+        cJSON* sample_rate = cJSON_GetObjectItem(audio_params, "sample_rate");
+        cJSON* frame_duration = cJSON_GetObjectItem(audio_params, "frame_duration");
+
+        if (cJSON_IsNumber(sample_rate) && sample_rate->valueint >= 8000 && sample_rate->valueint <= 48000) {
+            current_audio_sample_rate_ = sample_rate->valueint;
+        }
+        if (cJSON_IsNumber(frame_duration) && frame_duration->valueint > 0 && frame_duration->valueint <= 120) {
+            current_audio_frame_duration_ms_ = frame_duration->valueint;
+        }
+    }
+
+    ESP_LOGI(TAG, "BoChain audio params: sample_rate=%d, frame_duration=%dms",
+             current_audio_sample_rate_, current_audio_frame_duration_ms_);
+
     bochain_tts_active_ = true;
 
     // 新一轮旁路 TTS 开始，重置音频状态上报计数
@@ -482,8 +500,8 @@ void BochainBypassClient::HandleBinaryMessage(const char* data, size_t len) {
     auto& audio_service = Application::GetInstance().GetAudioService();
 
     auto packet = std::make_unique<AudioStreamPacket>();
-    packet->sample_rate = 24000;
-    packet->frame_duration = 60;
+    packet->sample_rate = current_audio_sample_rate_;
+    packet->frame_duration = current_audio_frame_duration_ms_;
     packet->timestamp = 0;
     packet->payload.assign(
         reinterpret_cast<const uint8_t*>(data),
@@ -510,9 +528,12 @@ void BochainBypassClient::HandleBinaryMessage(const char* data, size_t len) {
     ESP_LOGW(TAG, "Audio decode queue full, wait and report status, binary audio len=%u", static_cast<unsigned>(len));
     SendAudioStatus(true, 1, len);
 
+    // 给解码任务一个时间片，避免 WebSocket 接收回调持续占用 CPU。
+    vTaskDelay(pdMS_TO_TICKS(25));
+
     auto retry_packet = std::make_unique<AudioStreamPacket>();
-    retry_packet->sample_rate = 24000;
-    retry_packet->frame_duration = 60;
+    retry_packet->sample_rate = current_audio_sample_rate_;
+    retry_packet->frame_duration = current_audio_frame_duration_ms_;
     retry_packet->timestamp = 0;
     retry_packet->payload.assign(
         reinterpret_cast<const uint8_t*>(data),
@@ -618,6 +639,8 @@ void BochainBypassClient::SendAudioStatus(bool queue_full, int drop_count, size_
     cJSON_AddNumberToObject(root, "drop_count", audio_drop_report_count_ > 0 ? audio_drop_report_count_ : drop_count);
     cJSON_AddNumberToObject(root, "last_packet_len", static_cast<int>(last_packet_len));
     cJSON_AddNumberToObject(root, "free_sram", static_cast<int>(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+    cJSON_AddNumberToObject(root, "sample_rate", current_audio_sample_rate_);
+    cJSON_AddNumberToObject(root, "frame_duration", current_audio_frame_duration_ms_);
 
     char* json = cJSON_PrintUnformatted(root);
     if (json != nullptr) {

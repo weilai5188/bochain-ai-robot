@@ -72,6 +72,10 @@ private:
 	bool bochain_tts_active_ = false;
 	int64_t suppress_xiaozhi_until_us_ = 0;
 
+    // 旁路音频参数：由服务端每轮 TTS start 下发；没有下发时保持旧版 24k/60ms。
+    int current_audio_sample_rate_ = 24000;
+    int current_audio_frame_duration_ms_ = 60;
+
     // 音频队列满状态上报限频，避免队列满时疯狂发 JSON
     int64_t last_audio_status_us_ = 0;
     int audio_drop_report_count_ = 0;

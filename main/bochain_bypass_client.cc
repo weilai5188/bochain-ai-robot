@@ -742,17 +742,28 @@ void BochainBypassClient::SendAudioStatus(bool queue_full, int drop_count, size_
     int queue_size = audio_service.GetDownlinkQueueSize();
     int queue_capacity = audio_service.GetDownlinkQueueCapacity();
 
-    // V8 smooth：提前把高水位当作 queue_full 上报。
-    // 之前 playback_queue 已经 2/2、decode_queue 已经 24/40 时仍然 queue_full=false，
-    // 服务端就不会短暂停顿，听感会卡。
+    // V8.1 anti-tremble：高水位上报不要过于敏感。
+    // playback_queue=2/2 在正常播放时也可能长期满，单独用它触发 queue_full
+    // 会导致服务器频繁 pause，听感就是轻微“颤抖”。
     bool high_watermark = false;
-    if (decode_queue_capacity > 0 && decode_queue_size >= (decode_queue_capacity * 3 / 4)) {
+
+    // 解码队列真正接近满时才认为需要服务端让速。
+    if (decode_queue_capacity > 0 && decode_queue_size >= (decode_queue_capacity * 4 / 5)) {
         high_watermark = true;
     }
-    if (playback_queue_capacity > 0 && playback_queue_size >= playback_queue_capacity) {
+
+    // 下行队列明显积压时才认为网络/播放链路吃紧。
+    if (queue_capacity > 0 && queue_size >= (queue_capacity * 5 / 6)) {
         high_watermark = true;
     }
-    if (queue_capacity > 0 && queue_size >= (queue_capacity * 4 / 5)) {
+
+    // playback 队列满只有在 decode 队列也偏高时才触发，避免正常满队列误报。
+    if (
+        playback_queue_capacity > 0 &&
+        playback_queue_size >= playback_queue_capacity &&
+        decode_queue_capacity > 0 &&
+        decode_queue_size >= (decode_queue_capacity * 3 / 4)
+    ) {
         high_watermark = true;
     }
 

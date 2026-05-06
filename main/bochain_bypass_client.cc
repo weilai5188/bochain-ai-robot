@@ -12,6 +12,7 @@
 #include <cstring>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <esp_wifi.h>
 #include "esp_heap_caps.h"
 #include <esp_system.h>
 
@@ -418,45 +419,59 @@ void BochainBypassClient::HandleTtsMessage(cJSON* root) {
     const char* state_value = state->valuestring;
 
 if (strcmp(state_value, "start") == 0) {
-    ESP_LOGI(TAG, "BoChain TTS start");
+      ESP_LOGI(TAG, "BoChain TTS start");
 
-    // 服务端每轮 TTS start 下发真实音频参数，固件按参数入队，不再写死 24k。
-    cJSON* audio_params = cJSON_GetObjectItem(root, "audio_params");
-    if (cJSON_IsObject(audio_params)) {
-        cJSON* sample_rate = cJSON_GetObjectItem(audio_params, "sample_rate");
-        cJSON* frame_duration = cJSON_GetObjectItem(audio_params, "frame_duration");
+      // 服务端每轮 TTS start 下发真实音频参数，固件按参数入队，不再写死 24k。
+      cJSON* audio_params = cJSON_GetObjectItem(root, "audio_params");
+      if (cJSON_IsObject(audio_params)) {
+          cJSON* sample_rate = cJSON_GetObjectItem(audio_params, "sample_rate");
+          cJSON* frame_duration = cJSON_GetObjectItem(audio_params, "frame_duration");
 
-        if (cJSON_IsNumber(sample_rate) && sample_rate->valueint >= 8000 && sample_rate->valueint <= 48000) {
-            current_audio_sample_rate_ = sample_rate->valueint;
-        }
-        if (cJSON_IsNumber(frame_duration) && frame_duration->valueint > 0 && frame_duration->valueint <= 120) {
-            current_audio_frame_duration_ms_ = frame_duration->valueint;
-        }
-    }
+          if (cJSON_IsNumber(sample_rate) && sample_rate->valueint >= 8000 && sample_rate->valueint <= 48000) {
+              current_audio_sample_rate_ = sample_rate->valueint;
+          }
+          if (cJSON_IsNumber(frame_duration) && frame_duration->valueint > 0 && frame_duration->valueint <= 120) {
+              current_audio_frame_duration_ms_ = frame_duration->valueint;
+          }
+      }
 
-    ESP_LOGI(TAG, "BoChain audio params: sample_rate=%d, frame_duration=%dms",
-             current_audio_sample_rate_, current_audio_frame_duration_ms_);
+      ESP_LOGI(TAG, "BoChain audio params: sample_rate=%d, frame_duration=%dms",
+               current_audio_sample_rate_, current_audio_frame_duration_ms_);
 
-    bochain_tts_active_ = true;
+      bochain_tts_active_ = true;
 
-    // 新一轮旁路 TTS 开始，重置音频状态上报计数
-    // 避免上一轮累计的 drop_count 影响下一轮自适应流控
-    audio_drop_report_count_ = 0;
-    last_audio_status_us_ = 0;
-    last_audio_ready_us_ = 0;
-    last_audio_ready_credits_ = -1;
+      // V8 smooth：BoChain 旁路 TTS 播放期间关闭 WiFi 省电，减少 WebSocket 音频抖动。
+      esp_wifi_set_ps(WIFI_PS_NONE);
 
-    auto& app = Application::GetInstance();
-    app.GetAudioService().ResetDecoder();
-    SendAudioReady(true, 0);
+      // 新一轮旁路 TTS 开始，重置音频状态上报计数
+      // 避免上一轮累计的 drop_count 影响下一轮自适应流控
+      audio_drop_report_count_ = 0;
+      last_audio_status_us_ = 0;
+      last_audio_ready_us_ = 0;
+      last_audio_ready_credits_ = -1;
 
-    app.Schedule([]() {
-        Application::GetInstance().SetDeviceState(kDeviceStateSpeaking);
-    });
+      auto& app = Application::GetInstance();
+      app.GetAudioService().ResetDecoder();
+      SendAudioReady(true, 0);
 
-    SendAck("tts", "start", "bochain tts started");
-    return;
-}
+      app.Schedule([]() {
+          auto& app = Application::GetInstance();
+          auto state = app.GetDeviceState();
+
+          // V8 smooth：官方激活阶段不要强行切 speaking，避免 activating -> speaking 非法状态。
+          if (state == kDeviceStateActivating) {
+              ESP_LOGW(TAG, "Skip BoChain speaking state while activating");
+              return;
+          }
+
+          if (state != kDeviceStateSpeaking) {
+              app.SetDeviceState(kDeviceStateSpeaking);
+          }
+      });
+
+      SendAck("tts", "start", "bochain tts started");
+      return;
+  }
 
     if (strcmp(state_value, "sentence_start") == 0) {
         cJSON* text = cJSON_GetObjectItem(root, "text");
@@ -482,6 +497,9 @@ if (strcmp(state_value, "start") == 0) {
     ) {
         ESP_LOGI(TAG, "BoChain TTS stop");
         bochain_tts_active_ = false;
+
+        // V8 smooth：测试阶段不立刻恢复 WiFi 省电，优先保证旁路流式音频稳定。
+        esp_wifi_set_ps(WIFI_PS_NONE);
 
         auto& app = Application::GetInstance();
         app.Schedule([]() {
@@ -724,6 +742,26 @@ void BochainBypassClient::SendAudioStatus(bool queue_full, int drop_count, size_
     int queue_size = audio_service.GetDownlinkQueueSize();
     int queue_capacity = audio_service.GetDownlinkQueueCapacity();
 
+    // V8 smooth：提前把高水位当作 queue_full 上报。
+    // 之前 playback_queue 已经 2/2、decode_queue 已经 24/40 时仍然 queue_full=false，
+    // 服务端就不会短暂停顿，听感会卡。
+    bool high_watermark = false;
+    if (decode_queue_capacity > 0 && decode_queue_size >= (decode_queue_capacity * 3 / 4)) {
+        high_watermark = true;
+    }
+    if (playback_queue_capacity > 0 && playback_queue_size >= playback_queue_capacity) {
+        high_watermark = true;
+    }
+    if (queue_capacity > 0 && queue_size >= (queue_capacity * 4 / 5)) {
+        high_watermark = true;
+    }
+
+    if (high_watermark) {
+        queue_full = true;
+    }
+
+    cJSON_ReplaceItemInObject(root, "queue_full", cJSON_CreateBool(queue_full));
+
     cJSON_AddNumberToObject(root, "queue_size", queue_size);
     cJSON_AddNumberToObject(root, "queue_capacity", queue_capacity);
     cJSON_AddNumberToObject(root, "decode_queue_size", decode_queue_size);
@@ -737,7 +775,7 @@ void BochainBypassClient::SendAudioStatus(bool queue_full, int drop_count, size_
 
     char* json = cJSON_PrintUnformatted(root);
     if (json != nullptr) {
-        ESP_LOGW(TAG, "Send audio_status: %s", json);
+        ESP_LOGD(TAG, "Send audio_status: %s", json);
         websocket_->Send(json);
         cJSON_free(json);
     }

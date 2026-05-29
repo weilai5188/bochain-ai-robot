@@ -15,13 +15,17 @@
 #include <esp_wifi.h>
 #include "esp_heap_caps.h"
 #include <esp_system.h>
+#include <algorithm>
+#include <cstdio>
 
 #define TAG "BochainBypass"
 
 // 小智官方聊天走 OTA 下发的官方 websocket；这里是铂链直播旁路通道。
-#define DEFAULT_BOCHAIN_BYPASS_WS_URL "ws://robot.blsx.com:8011/danmaku/"
+#define DEFAULT_BOCHAIN_BYPASS_WS_URL "wss://live.blsx.com/ws/live-device"
+#define DEFAULT_BOCHAIN_REGISTER_URL "https://live.blsx.com/api/live-console/device/register"
 #define DEFAULT_BOCHAIN_DEVICE_ID_PREFIX "BL-ESP32-"
-#define DEFAULT_BOCHAIN_TOKEN "mr.fu875188"
+#define DEFAULT_BOCHAIN_TOKEN ""
+#define LEGACY_BOCHAIN_TOKEN "mr.fu875188"
 
 namespace {
 const char* GetJsonString(cJSON* root, const char* key) {
@@ -41,6 +45,27 @@ std::string FirstJsonString(cJSON* root, const char* const* keys, size_t count) 
 
 bool IsType(const char* actual, const char* expected) {
     return actual != nullptr && strcmp(actual, expected) == 0;
+}
+
+
+std::string UrlEncode(const std::string& value) {
+    std::string out;
+    char buf[4];
+    for (unsigned char c : value) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out.push_back(static_cast<char>(c));
+        } else {
+            snprintf(buf, sizeof(buf), "%%%02X", c);
+            out += buf;
+        }
+    }
+    return out;
+}
+
+bool LooksLikeLiveConsoleUrl(const std::string& url) {
+    return url.find("live.blsx.com/ws/live-device") != std::string::npos ||
+           url.find("live.blsx.com/ws/device") != std::string::npos ||
+           url.find("live.blsx.com/ws/bochain-device") != std::string::npos;
 }
 
 void PlayDigitSound(char digit) {
@@ -69,11 +94,24 @@ BochainBypassClient& BochainBypassClient::GetInstance() {
 void BochainBypassClient::LoadSettings() {
     Settings settings("bochain", false);
     configured_url_ = settings.GetString("url", DEFAULT_BOCHAIN_BYPASS_WS_URL);
+    register_url_ = settings.GetString("register_url", DEFAULT_BOCHAIN_REGISTER_URL);
     token_ = settings.GetString("token", DEFAULT_BOCHAIN_TOKEN);
     device_id_ = settings.GetString("device_id", "");
-    speak_bind_code_ = settings.GetBool("speak_bind_code", false);
+    speak_bind_code_ = settings.GetBool("speak_bind_code", true);
+
+    // 旧版小皮/旁路固定 token 不再作为直播中控台认证 token 使用。
+    // 发现旧 token 时清空，让设备重新向我们的后台注册并拿 live_devices.device_token。
+    if (token_ == LEGACY_BOCHAIN_TOKEN) {
+        token_.clear();
+    }
+
     if (device_id_.empty()) {
         device_id_ = std::string(DEFAULT_BOCHAIN_DEVICE_ID_PREFIX) + SystemInfo::GetMacAddress();
+    }
+
+    if (!LooksLikeLiveConsoleUrl(configured_url_)) {
+        ESP_LOGW(TAG, "Configured bypass url is legacy, switch to live-console default: %s", configured_url_.c_str());
+        configured_url_ = DEFAULT_BOCHAIN_BYPASS_WS_URL;
     }
 }
 
@@ -121,30 +159,155 @@ bool BochainBypassClient::IsConnected() const {
 
 std::vector<std::string> BochainBypassClient::BuildCandidateUrls() const {
     std::vector<std::string> urls;
-    if (!configured_url_.empty()) {
-        urls.push_back(configured_url_);
-    }
 
-    // 一次构建多种候选地址，方便远程打包后真机直接多试几个路径。
+    // 直播中控台设备入口优先，不再依赖小皮/旧 robot:8011 通道。
     const char* defaults[] = {
-        "ws://robot.blsx.com:8011/danmaku/",
-        "ws://robot.blsx.com:8011/danmaku",
-        "ws://robot.blsx.com:8011/",
-        "ws://robot.blsx.com:8011"
+        configured_url_.empty() ? DEFAULT_BOCHAIN_BYPASS_WS_URL : configured_url_.c_str(),
+        "wss://live.blsx.com/ws/live-device",
+        "wss://live.blsx.com/ws/device",
+        "wss://live.blsx.com/ws/bochain-device"
     };
+
     for (auto url : defaults) {
+        if (url == nullptr || url[0] == '\0') continue;
+        std::string full = BuildAuthenticatedWsUrl(url);
         bool exists = false;
         for (auto& item : urls) {
-            if (item == url) {
+            if (item == full) {
                 exists = true;
                 break;
             }
         }
-        if (!exists) {
-            urls.push_back(url);
-        }
+        if (!exists) urls.push_back(full);
     }
     return urls;
+}
+
+std::string BochainBypassClient::BuildAuthenticatedWsUrl(const std::string& base_url) const {
+    std::string url = base_url;
+    // 如果配置里已经带了参数，不重复追加。
+    if (url.find("device_id=") != std::string::npos && url.find("token=") != std::string::npos) {
+        return url;
+    }
+    url += (url.find('?') == std::string::npos) ? "?" : "&";
+    url += "device_id=" + UrlEncode(device_id_);
+    url += "&token=" + UrlEncode(token_);
+    return url;
+}
+
+
+bool BochainBypassClient::RegisterWithLiveConsole() {
+    if (!token_.empty() && token_ != LEGACY_BOCHAIN_TOKEN) {
+        return true;
+    }
+
+    auto network = Board::GetInstance().GetNetwork();
+    if (network == nullptr) {
+        ESP_LOGE(TAG, "Network is null, cannot register live device");
+        return false;
+    }
+
+    auto http = network->CreateHttp(0);
+    if (http == nullptr) {
+        ESP_LOGE(TAG, "Failed to create http client for live device register");
+        return false;
+    }
+
+    http->SetHeader("Content-Type", "application/json");
+    http->SetHeader("User-Agent", SystemInfo::GetUserAgent().c_str());
+    http->SetHeader("Device-Id", device_id_.c_str());
+    http->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "device_id", device_id_.c_str());
+    cJSON_AddStringToObject(root, "device_name", "铂链ESP32语音终端");
+    cJSON_AddStringToObject(root, "device_type", "xiaozhi");
+
+    cJSON* caps = cJSON_CreateObject();
+    cJSON_AddBoolToObject(caps, "screen_display", true);
+    cJSON_AddBoolToObject(caps, "system_tts", true);
+    cJSON_AddBoolToObject(caps, "bochain_stream_tts", true);
+    cJSON_AddBoolToObject(caps, "support_bind_code", true);
+    cJSON_AddBoolToObject(caps, "support_audio_ready", true);
+    // 当前固件还没有 MP3/URL 解码管线，远程 URL 先不声明为可用，避免后台误判。
+    cJSON_AddBoolToObject(caps, "remote_audio_url", false);
+    cJSON_AddItemToObject(root, "capabilities", caps);
+
+    char* body = cJSON_PrintUnformatted(root);
+    if (body == nullptr) {
+        cJSON_Delete(root);
+        return false;
+    }
+    http->SetContent(std::string(body));
+    cJSON_free(body);
+    cJSON_Delete(root);
+
+    ESP_LOGI(TAG, "Register live device: %s", register_url_.c_str());
+    if (!http->Open("POST", register_url_)) {
+        ESP_LOGE(TAG, "Open register http failed, code=0x%x", http->GetLastError());
+        return false;
+    }
+
+    int status = http->GetStatusCode();
+    std::string resp = http->ReadAll();
+    http->Close();
+    ESP_LOGI(TAG, "Register response status=%d body=%s", status, resp.c_str());
+    if (status < 200 || status >= 300) {
+        return false;
+    }
+
+    cJSON* json = cJSON_Parse(resp.c_str());
+    if (json == nullptr) {
+        return false;
+    }
+
+    const char* token_keys[] = {"device_token", "token"};
+    std::string new_token = FirstJsonString(json, token_keys, sizeof(token_keys) / sizeof(token_keys[0]));
+    cJSON* device = cJSON_GetObjectItem(json, "device");
+    if (new_token.empty() && cJSON_IsObject(device)) {
+        new_token = FirstJsonString(device, token_keys, sizeof(token_keys) / sizeof(token_keys[0]));
+    }
+
+    const char* code_keys[] = {"bind_code", "bindCode", "code"};
+    std::string bind_code = FirstJsonString(json, code_keys, sizeof(code_keys) / sizeof(code_keys[0]));
+    if (bind_code.empty() && cJSON_IsObject(device)) {
+        bind_code = FirstJsonString(device, code_keys, sizeof(code_keys) / sizeof(code_keys[0]));
+    }
+
+    int bind_status = 0;
+    cJSON* bind_status_item = cJSON_GetObjectItem(json, "bind_status");
+    if (!cJSON_IsNumber(bind_status_item) && cJSON_IsObject(device)) {
+        bind_status_item = cJSON_GetObjectItem(device, "bind_status");
+    }
+    if (cJSON_IsNumber(bind_status_item)) {
+        bind_status = bind_status_item->valueint;
+    }
+
+    cJSON_Delete(json);
+
+    if (new_token.empty()) {
+        ESP_LOGE(TAG, "Register ok but device_token missing");
+        return false;
+    }
+
+    token_ = new_token;
+    bind_status_ = bind_status;
+    if (!bind_code.empty() && bind_status_ == 0) {
+        latest_bind_code_ = bind_code;
+        latest_bind_prompt_ = "铂链绑定码：" + bind_code;
+        ShowBindCode(false, "register");
+    }
+
+    {
+        Settings settings("bochain", true);
+        settings.SetString("device_id", device_id_);
+        settings.SetString("token", token_);
+        settings.SetString("url", configured_url_);
+        settings.SetString("register_url", register_url_);
+    }
+
+    ESP_LOGI(TAG, "Live device registered, bind_status=%d, token_tail=%s", bind_status_, token_.size() > 6 ? token_.substr(token_.size() - 6).c_str() : token_.c_str());
+    return true;
 }
 
 void BochainBypassClient::TaskEntry(void* arg) {
@@ -156,9 +319,17 @@ void BochainBypassClient::TaskEntry(void* arg) {
 }
 
 void BochainBypassClient::Run() {
-    ESP_LOGI(TAG, "Task started, configured_url=%s, device_id=%s", configured_url_.c_str(), device_id_.c_str());
+    ESP_LOGI(TAG, "Task started, configured_url=%s, register_url=%s, device_id=%s", configured_url_.c_str(), register_url_.c_str(), device_id_.c_str());
+
+    if (!RegisterWithLiveConsole()) {
+        ESP_LOGW(TAG, "Initial live-console register failed, will retry before reconnect");
+    }
 
     while (!stop_requested_) {
+        if (token_.empty() && !RegisterWithLiveConsole()) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
         bool connected = false;
         auto urls = BuildCandidateUrls();
         for (const auto& url : urls) {
@@ -176,7 +347,13 @@ void BochainBypassClient::Run() {
         }
 
         if (!connected) {
-            ESP_LOGW(TAG, "All candidate urls failed, retry in 5 seconds");
+            ESP_LOGW(TAG, "All live-console candidate urls failed, retry in 5 seconds");
+            // 可能是服务器重装/数据库清空导致旧 token 失效，清空后下轮重新注册。
+            if (!token_.empty()) {
+                token_.clear();
+                Settings settings("bochain", true);
+                settings.EraseKey("token");
+            }
             for (int i = 0; i < 50 && !stop_requested_; ++i) {
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
@@ -192,6 +369,7 @@ void BochainBypassClient::Run() {
             if (bochain_tts_active_) {
                 SendAudioReady(false, 0);
             }
+            MaybeRepeatBindCodePrompt();
             vTaskDelay(pdMS_TO_TICKS(200));
         }
 
@@ -254,7 +432,7 @@ void BochainBypassClient::SendHello() {
     cJSON_AddStringToObject(root, "role", "speaker");
     cJSON_AddStringToObject(root, "device_id", device_id_.c_str());
     cJSON_AddStringToObject(root, "token", token_.c_str());
-    cJSON_AddStringToObject(root, "version", "1.0.3-bochain-audio-ready-v7");
+    cJSON_AddStringToObject(root, "version", "1.0.4-live-console-direct-v1");
     cJSON_AddStringToObject(root, "board_uuid", Board::GetInstance().GetUuid().c_str());
     cJSON_AddStringToObject(root, "mac", SystemInfo::GetMacAddress().c_str());
     cJSON_AddStringToObject(root, "bypass_url", current_url_.c_str());
@@ -263,6 +441,9 @@ void BochainBypassClient::SendHello() {
     cJSON_AddBoolToObject(root, "support_digit_voice", true);
     cJSON_AddBoolToObject(root, "support_voice_query_bind_code", true);
     cJSON_AddBoolToObject(root, "support_play_audio_command", true);
+    cJSON_AddBoolToObject(root, "support_live_console_action", true);
+    cJSON_AddBoolToObject(root, "remote_audio_url", false);
+    cJSON_AddBoolToObject(root, "bochain_stream_tts", true);
 
     // 告诉铂链服务器：本固件支持音频队列状态反馈
     cJSON_AddBoolToObject(root, "support_audio_status", true);
@@ -307,6 +488,41 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
 
     const char* message_type = type->valuestring;
 
+    // 兼容直播中控台设备通道：{ type:"action", action:{ actionType:"..." } }
+    if (IsType(message_type, "action")) {
+        cJSON* action = cJSON_GetObjectItem(root, "action");
+        if (cJSON_IsObject(action)) {
+            const char* action_keys[] = {"actionType", "action_type", "type", "command", "cmd"};
+            std::string action_type = FirstJsonString(action, action_keys, sizeof(action_keys) / sizeof(action_keys[0]));
+            if (action_type == "play_audio_url" || action_type == "play_remote_audio" || action_type == "play_audio") {
+                HandlePlayAudioMessage(action);
+            } else if (action_type == "stop_audio" || action_type == "stop_current_audio" || action_type == "clear_audio_queue") {
+                HandleStopAudioMessage(action);
+            } else if (action_type == "clear_play_status") {
+                DisplayBypassText("播放状态已清除", 3000);
+                SendAck("clear_play_status", "ok", "status cleared");
+            } else if (action_type == "speak" || action_type == "display" || action_type == "text" || action_type == "banner") {
+                const char* keys[] = {"text", "display_text", "speak_text", "message", "content", "title"};
+                std::string text = FirstJsonString(action, keys, sizeof(keys) / sizeof(keys[0]));
+                if (!text.empty()) HandleSpeakText(text);
+                SendAck(action_type.c_str(), "ok", text);
+            } else {
+                ESP_LOGW(TAG, "Unhandled live-console action: %s", action_type.c_str());
+                SendAck(action_type.empty() ? "action" : action_type.c_str(), "ignored", "unsupported action");
+            }
+        }
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (IsType(message_type, "hello")) {
+        cJSON* bs = cJSON_GetObjectItem(root, "bind_status");
+        if (cJSON_IsNumber(bs)) bind_status_ = bs->valueint;
+        ESP_LOGI(TAG, "Live-console hello ok, bind_status=%d", bind_status_);
+        cJSON_Delete(root);
+        return;
+    }
+
 	if (IsType(message_type, "bind_code")) {
 		HandleBindCodeMessage(root);
 	} else if (IsType(message_type, "query_bind_code")) {
@@ -334,7 +550,8 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
         } else {
             ESP_LOGW(TAG, "%s message missing text", message_type);
         }
-    } else if (IsType(message_type, "bind_success")) {
+    } else if (IsType(message_type, "bind_success") || IsType(message_type, "bound")) {
+        bind_status_ = 1;
         latest_bind_code_.clear();
         latest_bind_prompt_.clear();
         const char* success_keys[] = {"text", "message", "display_text"};
@@ -570,9 +787,9 @@ void BochainBypassClient::HandleBinaryMessage(const char* data, size_t len) {
     return;
 }
 void BochainBypassClient::HandlePlayAudioMessage(cJSON* root) {
-    const char* url_keys[] = {"audio_url", "url", "src"};
+    const char* url_keys[] = {"audioUrl", "audio_url", "url", "src", "mp3_url", "fileUrl", "file_url", "playUrl", "play_url"};
     std::string url = FirstJsonString(root, url_keys, sizeof(url_keys) / sizeof(url_keys[0]));
-    const char* title_keys[] = {"title", "name", "text", "message"};
+    const char* title_keys[] = {"title", "audioTitle", "audio_title", "name", "text", "message"};
     std::string title = FirstJsonString(root, title_keys, sizeof(title_keys) / sizeof(title_keys[0]));
     if (title.empty()) {
         title = "音频播放测试";
@@ -583,17 +800,17 @@ void BochainBypassClient::HandlePlayAudioMessage(cJSON* root) {
         message = "收到音频播放指令，但没有音频地址";
         ESP_LOGW(TAG, "%s", message.c_str());
         DisplayBypassText(message, 5000);
-        SendAck("play_audio", "error", message);
+        SendAck("play_audio_url", "error", message);
         return;
     }
 
-    // 当前版本先做设备端实时响应和确认：显示收到的音频任务，并播放提示音。
-    // 真正播放 MP3/WAV/OPUS URL 需要下一版接 HTTP 下载 + 解码/播放管线。
-    message = "收到音频：" + title;
-    ESP_LOGI(TAG, "play_audio command received, title=%s, url=%s", title.c_str(), url.c_str());
+    // 直播中控台已经可以把命令推到 ESP32。当前固件音频管线支持的是“服务端按 Opus 帧推流”模式；
+    // 对 MP3/URL 直放暂不声明 remote_audio_url，避免后台误以为已经能直接解码网络 MP3。
+    message = "收到播报任务：" + title;
+    ESP_LOGI(TAG, "play_audio_url command received, title=%s, url=%s", title.c_str(), url.c_str());
     DisplayBypassText(message, 6000);
     Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
-    SendAck("play_audio", "received", url);
+    SendAck("play_audio_url", "received", url);
 }
 
 void BochainBypassClient::HandleStopAudioMessage(cJSON* root) {
@@ -613,7 +830,7 @@ void BochainBypassClient::ShowBindCode(bool speak, const char* source) {
     }
 
     display_text = "铂链绑定码：" + latest_bind_code_;
-    DisplayBypassText(display_text, 10000);
+    DisplayBypassText(display_text, 20000);
     ESP_LOGI(TAG, "Show BoChain bind code, source=%s, speak=%d", source ? source : "unknown", speak ? 1 : 0);
 
     if (speak) {
@@ -812,7 +1029,9 @@ void BochainBypassClient::HandleBindCodeMessage(cJSON* root) {
         return;
     }
 
+    bind_status_ = 0;
     latest_bind_code_ = code;
+    last_bind_prompt_us_ = 0;
 
     std::string display_text = "铂链绑定码：" + code;
     const char* display_from_json = GetJsonString(root, "display_text");
@@ -825,6 +1044,7 @@ void BochainBypassClient::HandleBindCodeMessage(cJSON* root) {
         }
     }
 
+    latest_bind_prompt_ = display_text;
     ESP_LOGI(TAG, "BoChain bind code cached: %s", code.c_str());
 
     // 关键优化：
@@ -842,7 +1062,7 @@ void BochainBypassClient::HandleBindCodeMessage(cJSON* root) {
                 auto display = Board::GetInstance().GetDisplay();
                 if (display) {
                     display->SetChatMessage("system", message.c_str());
-                    display->ShowNotification(message.c_str(), 10000);
+                    display->ShowNotification(message.c_str(), 20000);
                 }
             });
 
@@ -857,7 +1077,7 @@ void BochainBypassClient::HandleBindCodeMessage(cJSON* root) {
     );
 
     if (speak_bind_code_) {
-        ESP_LOGI(TAG, "speak_bind_code is enabled, but auto speak is suppressed during boot bind flow");
+        ESP_LOGI(TAG, "speak_bind_code enabled; first automatic speak will occur after boot delay");
     }
 }
 
@@ -890,6 +1110,36 @@ void BochainBypassClient::SpeakBindCodeDigits(const std::string& code, const std
             PlayDigitSound(digit);
         }
     });
+}
+
+
+void BochainBypassClient::MaybeRepeatBindCodePrompt() {
+    if (bind_status_ != 0 || latest_bind_code_.empty()) {
+        return;
+    }
+
+    int64_t now = esp_timer_get_time();
+    const int64_t interval_us = 180LL * 1000 * 1000;
+    const int64_t boot_grace_us = 60LL * 1000 * 1000;
+
+    if (last_bind_prompt_us_ == 0) {
+        last_bind_prompt_us_ = now;
+        return;
+    }
+
+    if (now < boot_grace_us || (now - last_bind_prompt_us_) < interval_us) {
+        return;
+    }
+
+    auto state = Application::GetInstance().GetDeviceState();
+    if (state == kDeviceStateSpeaking || state == kDeviceStateListening || state == kDeviceStateActivating) {
+        // 正在说话/聆听/激活时不抢音频，下一个循环再判断。
+        last_bind_prompt_us_ = now - interval_us + 10LL * 1000 * 1000;
+        return;
+    }
+
+    last_bind_prompt_us_ = now;
+    ShowBindCode(speak_bind_code_, "auto_repeat");
 }
 
 void BochainBypassClient::SendPong() {

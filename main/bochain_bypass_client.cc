@@ -292,23 +292,40 @@ bool BochainBypassClient::RegisterWithLiveConsole() {
 
     token_ = new_token;
 
-    // 关键修复：
-    // 有 bind_code 时，以 bind_code 为准，说明铂链直播助手仍处于待绑定状态。
-    // 不能因为 bind_status != 0 就停止播报，因为该状态可能来自小智已绑定/已激活。
+    // 正确顺序：
+    // 1. 配网后如果拿到铂链 bind_code，先缓存，不抢小智官方绑定码播报。
+    // 2. 等小智绑定/激活状态 bind_status != 0 后，再启动铂链绑定码播报窗口。
+    // 3. 只要接口仍返回 bind_code，就说明铂链设备还未绑定，不能停止播报。
+    // 4. 接口不再返回 bind_code 时，才认为铂链后台已绑定，停止播报。
     if (!bind_code.empty()) {
-        bool is_new_bind_code = latest_bind_code_ != bind_code || bind_prompt_window_start_us_ == 0;
-        bind_status_ = 0;
+        bool is_new_bind_code = latest_bind_code_ != bind_code;
         latest_bind_code_ = bind_code;
         latest_bind_prompt_ = "铂链直播助手绑定码是" + bind_code;
 
-        if (is_new_bind_code) {
-            RestartBindCodePromptWindow();
-            ShowBindCode(speak_bind_code_, "register");
+        if (bind_status != 0) {
+            bind_status_ = 0;  // 铂链仍未绑定，继续播我们的码
+            if (is_new_bind_code || bind_prompt_window_start_us_ == 0) {
+                RestartBindCodePromptWindow();
+                ShowBindCode(speak_bind_code_, "register_after_xiaozhi_bound");
+            }
+        } else {
+            // 小智还没绑定/激活，只缓存铂链码，不播报，避免和小智官方码打架。
+            bind_status_ = 0;
+            bind_prompt_window_start_us_ = 0;
+            last_bind_prompt_us_ = 0;
+            last_bind_status_refresh_us_ = 0;
+            ESP_LOGI(TAG, "BoChain bind code cached, wait Xiaozhi bound before speaking");
         }
     } else {
-        bind_status_ = bind_status;
-        if (bind_status_ != 0) {
-            StopBindCodePrompt("register_bound_status_no_bind_code");
+        // 如果之前已经拿到过铂链绑定码，但本次 register 不再返回 bind_code，
+        // 说明铂链后台大概率已完成绑定或已清除待绑定码，必须停止播报。
+        if (!latest_bind_code_.empty()) {
+            StopBindCodePrompt("register_no_bind_code_stop");
+        } else {
+            bind_status_ = bind_status;
+            if (bind_status_ != 0) {
+                StopBindCodePrompt("register_bound_status_no_bind_code");
+            }
         }
     }
 
@@ -532,10 +549,16 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
     if (IsType(message_type, "hello")) {
         cJSON* bs = cJSON_GetObjectItem(root, "bind_status");
         if (cJSON_IsNumber(bs)) {
-            // hello 里的 bind_status 可能代表小智连接/激活状态，不能用它停止铂链绑定码播报。
-            bind_status_ = bs->valueint;
+            int xiaozhi_bind_status = bs->valueint;
+            ESP_LOGI(TAG, "Live-console hello ok, xiaozhi_bind_status=%d", xiaozhi_bind_status);
+
+            // 小智绑定/激活后，如果本地已经缓存了铂链绑定码，就开始播报铂链码。
+            if (xiaozhi_bind_status != 0 && !latest_bind_code_.empty() && bind_prompt_window_start_us_ == 0) {
+                bind_status_ = 0;
+                RestartBindCodePromptWindow();
+                ShowBindCode(speak_bind_code_, "hello_after_xiaozhi_bound");
+            }
         }
-        ESP_LOGI(TAG, "Live-console hello ok, bind_status=%d", bind_status_);
         cJSON_Delete(root);
         return;
     }
@@ -1141,17 +1164,21 @@ void BochainBypassClient::MaybeRepeatBindCodePrompt() {
     }
 
     int64_t now = esp_timer_get_time();
-    const int64_t window_us = 180LL * 1000 * 1000;
     const int64_t interval_us = 5LL * 1000 * 1000;
     const int64_t status_refresh_interval_us = 10LL * 1000 * 1000;
 
     if (bind_prompt_window_start_us_ == 0) {
-        RestartBindCodePromptWindow();
-    }
-
-    if ((now - bind_prompt_window_start_us_) > window_us) {
+        // 还没等到小智绑定/激活，不启动铂链码播报窗口。
+        // 但允许每 10 秒刷新一次 register，发现小智已绑定后由 RegisterWithLiveConsole 启动播报。
+        if (last_bind_status_refresh_us_ == 0 || (now - last_bind_status_refresh_us_) >= status_refresh_interval_us) {
+            last_bind_status_refresh_us_ = now;
+            RegisterWithLiveConsole();
+        }
         return;
     }
+
+    // 3 分钟窗口到期后不再因为窗口结束而永久停止；
+    // 只要铂链后台还没绑定，继续每 5 秒播报，直到 register 不再返回 bind_code 或收到 bind_success。
 
     // 关键保险：后台绑定成功但 WebSocket 成功消息没推到设备时，设备要主动核验注册接口。
     // 只要接口返回 bind_status != 0，StopBindCodePrompt 会立刻清空绑定码并停止后续播报。

@@ -294,8 +294,9 @@ bool BochainBypassClient::RegisterWithLiveConsole() {
     bind_status_ = bind_status;
     if (!bind_code.empty() && bind_status_ == 0) {
         latest_bind_code_ = bind_code;
-        latest_bind_prompt_ = "铂链绑定码：" + bind_code;
-        ShowBindCode(false, "register");
+        latest_bind_prompt_ = "铂链直播助手绑定码是" + bind_code;
+        RestartBindCodePromptWindow();
+        ShowBindCode(speak_bind_code_, "register");
     }
 
     {
@@ -554,6 +555,8 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
         bind_status_ = 1;
         latest_bind_code_.clear();
         latest_bind_prompt_.clear();
+        bind_prompt_window_start_us_ = 0;
+        last_bind_prompt_us_ = 0;
         const char* success_keys[] = {"text", "message", "display_text"};
         std::string success_text = FirstJsonString(root, success_keys, sizeof(success_keys) / sizeof(success_keys[0]));
         if (success_text.empty()) {
@@ -637,6 +640,7 @@ void BochainBypassClient::HandleTtsMessage(cJSON* root) {
 
 if (strcmp(state_value, "start") == 0) {
       ESP_LOGI(TAG, "BoChain TTS start");
+      InterruptXiaozhiForBochainPush("bochain_tts_start");
 
       // 服务端每轮 TTS start 下发真实音频参数，固件按参数入队，不再写死 24k。
       cJSON* audio_params = cJSON_GetObjectItem(root, "audio_params");
@@ -787,6 +791,7 @@ void BochainBypassClient::HandleBinaryMessage(const char* data, size_t len) {
     return;
 }
 void BochainBypassClient::HandlePlayAudioMessage(cJSON* root) {
+    InterruptXiaozhiForBochainPush("play_audio_command");
     const char* url_keys[] = {"audioUrl", "audio_url", "url", "src", "mp3_url", "fileUrl", "file_url", "playUrl", "play_url"};
     std::string url = FirstJsonString(root, url_keys, sizeof(url_keys) / sizeof(url_keys[0]));
     const char* title_keys[] = {"title", "audioTitle", "audio_title", "name", "text", "message"};
@@ -829,11 +834,12 @@ void BochainBypassClient::ShowBindCode(bool speak, const char* source) {
         return;
     }
 
-    display_text = "铂链绑定码：" + latest_bind_code_;
+    display_text = "铂链直播助手绑定码是" + latest_bind_code_;
     DisplayBypassText(display_text, 20000);
     ESP_LOGI(TAG, "Show BoChain bind code, source=%s, speak=%d", source ? source : "unknown", speak ? 1 : 0);
 
     if (speak) {
+        last_bind_prompt_us_ = esp_timer_get_time();
         SpeakBindCodeDigits(latest_bind_code_, display_text);
     }
 }
@@ -1031,9 +1037,9 @@ void BochainBypassClient::HandleBindCodeMessage(cJSON* root) {
 
     bind_status_ = 0;
     latest_bind_code_ = code;
-    last_bind_prompt_us_ = 0;
+    RestartBindCodePromptWindow();
 
-    std::string display_text = "铂链绑定码：" + code;
+    std::string display_text = "铂链直播助手绑定码是" + code;
     const char* display_from_json = GetJsonString(root, "display_text");
     if (display_from_json && strlen(display_from_json) > 0) {
         display_text = display_from_json;
@@ -1047,37 +1053,11 @@ void BochainBypassClient::HandleBindCodeMessage(cJSON* root) {
     latest_bind_prompt_ = display_text;
     ESP_LOGI(TAG, "BoChain bind code cached: %s", code.c_str());
 
-    // 关键优化：
-    // 1. 不立即播报，避免和小智官方激活码混在一起
-    // 2. 不立即抢屏，避免覆盖小智官方激活码
-    // 3. 延迟显示铂链绑定码，只显示，不自动读
-    xTaskCreate(
-        [](void* arg) {
-            std::string* text = static_cast<std::string*>(arg);
-
-            // 给小智官方激活码留出播报/显示时间
-            vTaskDelay(pdMS_TO_TICKS(45000));
-
-            Application::GetInstance().Schedule([message = *text]() {
-                auto display = Board::GetInstance().GetDisplay();
-                if (display) {
-                    display->SetChatMessage("system", message.c_str());
-                    display->ShowNotification(message.c_str(), 20000);
-                }
-            });
-
-            delete text;
-            vTaskDelete(nullptr);
-        },
-        "bochain_bind_delay",
-        4096,
-        new std::string(display_text),
-        3,
-        nullptr
-    );
+    // 收到绑定码后立即进入 3 分钟播报窗口：有屏幕则显示，无屏幕也能听到数字。
+    ShowBindCode(speak_bind_code_, "bind_code_message");
 
     if (speak_bind_code_) {
-        ESP_LOGI(TAG, "speak_bind_code enabled; first automatic speak will occur after boot delay");
+        ESP_LOGI(TAG, "speak_bind_code enabled; repeat bind code every 5 seconds for 3 minutes");
     }
 }
 
@@ -1105,41 +1085,60 @@ void BochainBypassClient::SpeakBindCodeDigits(const std::string& code, const std
             display->SetChatMessage("system", display_text.c_str());
         }
 
-        // 不走小智官方 TTS，不影响官方对话链路。这里复用固件内置数字音频，保证无屏幕版本也能听到绑定码。
+        // 固件当前只有内置数字音频资源；文字完整显示为“铂链直播助手绑定码是xxxx”，
+        // 无屏幕设备至少能稳定听到绑定码数字，不依赖小智云端 TTS。
+        auto& audio_service = Application::GetInstance().GetAudioService();
+        audio_service.PlaySound(Lang::Sounds::OGG_POPUP);
         for (char digit : code) {
             PlayDigitSound(digit);
         }
     });
 }
 
+void BochainBypassClient::RestartBindCodePromptWindow() {
+    int64_t now = esp_timer_get_time();
+    bind_prompt_window_start_us_ = now;
+    last_bind_prompt_us_ = 0;
+}
+
+void BochainBypassClient::InterruptXiaozhiForBochainPush(const char* source) {
+    auto& app = Application::GetInstance();
+    auto state = app.GetDeviceState();
+    if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
+        ESP_LOGI(TAG, "Interrupt Xiaozhi for BoChain push, source=%s, state=%d", source ? source : "unknown", static_cast<int>(state));
+        app.AbortSpeaking(kAbortReasonNone);
+        app.GetAudioService().ResetDecoder();
+        suppress_xiaozhi_until_us_ = esp_timer_get_time() + 10LL * 1000 * 1000;
+    }
+}
 
 void BochainBypassClient::MaybeRepeatBindCodePrompt() {
-    if (bind_status_ != 0 || latest_bind_code_.empty()) {
+    if (bind_status_ != 0 || latest_bind_code_.empty() || !speak_bind_code_) {
         return;
     }
 
     int64_t now = esp_timer_get_time();
-    const int64_t interval_us = 180LL * 1000 * 1000;
-    const int64_t boot_grace_us = 60LL * 1000 * 1000;
+    const int64_t window_us = 180LL * 1000 * 1000;
+    const int64_t interval_us = 5LL * 1000 * 1000;
 
-    if (last_bind_prompt_us_ == 0) {
-        last_bind_prompt_us_ = now;
+    if (bind_prompt_window_start_us_ == 0) {
+        RestartBindCodePromptWindow();
+    }
+
+    if ((now - bind_prompt_window_start_us_) > window_us) {
         return;
     }
 
-    if (now < boot_grace_us || (now - last_bind_prompt_us_) < interval_us) {
+    if (last_bind_prompt_us_ != 0 && (now - last_bind_prompt_us_) < interval_us) {
         return;
     }
 
-    auto state = Application::GetInstance().GetDeviceState();
-    if (state == kDeviceStateSpeaking || state == kDeviceStateListening || state == kDeviceStateActivating) {
-        // 正在说话/聆听/激活时不抢音频，下一个循环再判断。
-        last_bind_prompt_us_ = now - interval_us + 10LL * 1000 * 1000;
+    if (Application::GetInstance().GetDeviceState() == kDeviceStateActivating) {
         return;
     }
 
     last_bind_prompt_us_ = now;
-    ShowBindCode(speak_bind_code_, "auto_repeat");
+    ShowBindCode(true, "auto_repeat_3min");
 }
 
 void BochainBypassClient::SendPong() {

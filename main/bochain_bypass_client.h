@@ -40,6 +40,8 @@ private:
     bool RegisterWithLiveConsole();
     std::string BuildAuthenticatedWsUrl(const std::string& base_url) const;
     void MaybeRepeatBindCodePrompt();
+    void RestartBindCodePromptWindow();
+    void InterruptXiaozhiForBochainPush(const char* source);
 	void HandleTextMessage(const char* data, size_t len);
 	void HandleBinaryMessage(const char* data, size_t len);
 	void HandleBindCodeMessage(cJSON* root);
@@ -78,6 +80,7 @@ private:
 	bool speak_bind_code_ = true;
     int bind_status_ = 0;
     int64_t last_bind_prompt_us_ = 0;
+    int64_t bind_prompt_window_start_us_ = 0;
 	bool bochain_tts_active_ = false;
 	int64_t suppress_xiaozhi_until_us_ = 0;
 

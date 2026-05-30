@@ -291,17 +291,24 @@ bool BochainBypassClient::RegisterWithLiveConsole() {
     }
 
     token_ = new_token;
-    bind_status_ = bind_status;
-    if (bind_status_ != 0) {
-        StopBindCodePrompt("register_bound_status");
-    } else if (!bind_code.empty()) {
+
+    // 关键修复：
+    // 有 bind_code 时，以 bind_code 为准，说明铂链直播助手仍处于待绑定状态。
+    // 不能因为 bind_status != 0 就停止播报，因为该状态可能来自小智已绑定/已激活。
+    if (!bind_code.empty()) {
         bool is_new_bind_code = latest_bind_code_ != bind_code || bind_prompt_window_start_us_ == 0;
+        bind_status_ = 0;
         latest_bind_code_ = bind_code;
         latest_bind_prompt_ = "铂链直播助手绑定码是" + bind_code;
-        // 周期刷新绑定状态时，如果还是同一个未绑定码，不重置 3 分钟窗口，避免一直播不停。
+
         if (is_new_bind_code) {
             RestartBindCodePromptWindow();
             ShowBindCode(speak_bind_code_, "register");
+        }
+    } else {
+        bind_status_ = bind_status;
+        if (bind_status_ != 0) {
+            StopBindCodePrompt("register_bound_status_no_bind_code");
         }
     }
 
@@ -525,10 +532,8 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
     if (IsType(message_type, "hello")) {
         cJSON* bs = cJSON_GetObjectItem(root, "bind_status");
         if (cJSON_IsNumber(bs)) {
+            // hello 里的 bind_status 可能代表小智连接/激活状态，不能用它停止铂链绑定码播报。
             bind_status_ = bs->valueint;
-            if (bind_status_ != 0) {
-                StopBindCodePrompt("hello_bound_status");
-            }
         }
         ESP_LOGI(TAG, "Live-console hello ok, bind_status=%d", bind_status_);
         cJSON_Delete(root);

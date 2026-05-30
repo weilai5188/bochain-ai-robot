@@ -82,6 +82,7 @@ private:
     int bind_status_ = 0;
     int64_t last_bind_prompt_us_ = 0;
     int64_t bind_prompt_window_start_us_ = 0;
+    int64_t last_bind_status_refresh_us_ = 0;
 	bool bochain_tts_active_ = false;
 	int64_t suppress_xiaozhi_until_us_ = 0;
 

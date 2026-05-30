@@ -1065,14 +1065,22 @@ void BochainBypassClient::HandleBindCodeMessage(cJSON* root) {
         }
     }
 
+    // 后台如果推空 code，说明绑定码已清除或设备已绑定，立即停止播报。
     if (code.empty()) {
-        ESP_LOGW(TAG, "bind_code message missing code");
+        ESP_LOGW(TAG, "bind_code message missing code, stop bind prompt");
+        StopBindCodePrompt("bind_code_message_empty_code");
+        return;
+    }
+
+    // 后台如果 bind_code 消息里明确带已绑定状态，也立即停止播报。
+    cJSON* bs = cJSON_GetObjectItem(root, "bind_status");
+    if (cJSON_IsNumber(bs) && bs->valueint != 0) {
+        StopBindCodePrompt("bind_code_message_bound_status");
         return;
     }
 
     bind_status_ = 0;
     latest_bind_code_ = code;
-    RestartBindCodePromptWindow();
 
     std::string display_text = "铂链直播助手绑定码是" + code;
     const char* display_from_json = GetJsonString(root, "display_text");
@@ -1086,14 +1094,13 @@ void BochainBypassClient::HandleBindCodeMessage(cJSON* root) {
     }
 
     latest_bind_prompt_ = display_text;
-    ESP_LOGI(TAG, "BoChain bind code cached: %s", code.c_str());
+    ESP_LOGI(TAG, "BoChain bind code cached: %s, wait Xiaozhi bound before speaking", code.c_str());
 
-    // 收到绑定码后立即进入 3 分钟播报窗口：有屏幕则显示，无屏幕也能听到数字。
-    ShowBindCode(speak_bind_code_, "bind_code_message");
-
-    if (speak_bind_code_) {
-        ESP_LOGI(TAG, "speak_bind_code enabled; repeat bind code every 5 seconds for 3 minutes");
-    }
+    // 关键：收到铂链绑定码时只缓存，不立即播报，避免抢小智官方绑定码。
+    // 等 hello/register 判断小智已绑定后，再 RestartBindCodePromptWindow + ShowBindCode。
+    bind_prompt_window_start_us_ = 0;
+    last_bind_prompt_us_ = 0;
+    last_bind_status_refresh_us_ = 0;
 }
 
 void BochainBypassClient::HandleSpeakText(const std::string& text) {

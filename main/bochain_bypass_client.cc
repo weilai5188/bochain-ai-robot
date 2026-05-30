@@ -292,11 +292,17 @@ bool BochainBypassClient::RegisterWithLiveConsole() {
 
     token_ = new_token;
     bind_status_ = bind_status;
-    if (!bind_code.empty() && bind_status_ == 0) {
+    if (bind_status_ != 0) {
+        StopBindCodePrompt("register_bound_status");
+    } else if (!bind_code.empty()) {
+        bool is_new_bind_code = latest_bind_code_ != bind_code || bind_prompt_window_start_us_ == 0;
         latest_bind_code_ = bind_code;
         latest_bind_prompt_ = "铂链直播助手绑定码是" + bind_code;
-        RestartBindCodePromptWindow();
-        ShowBindCode(speak_bind_code_, "register");
+        // 周期刷新绑定状态时，如果还是同一个未绑定码，不重置 3 分钟窗口，避免一直播不停。
+        if (is_new_bind_code) {
+            RestartBindCodePromptWindow();
+            ShowBindCode(speak_bind_code_, "register");
+        }
     }
 
     {
@@ -518,7 +524,12 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
 
     if (IsType(message_type, "hello")) {
         cJSON* bs = cJSON_GetObjectItem(root, "bind_status");
-        if (cJSON_IsNumber(bs)) bind_status_ = bs->valueint;
+        if (cJSON_IsNumber(bs)) {
+            bind_status_ = bs->valueint;
+            if (bind_status_ != 0) {
+                StopBindCodePrompt("hello_bound_status");
+            }
+        }
         ESP_LOGI(TAG, "Live-console hello ok, bind_status=%d", bind_status_);
         cJSON_Delete(root);
         return;
@@ -552,11 +563,7 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
             ESP_LOGW(TAG, "%s message missing text", message_type);
         }
     } else if (IsType(message_type, "bind_success") || IsType(message_type, "bound")) {
-        bind_status_ = 1;
-        latest_bind_code_.clear();
-        latest_bind_prompt_.clear();
-        bind_prompt_window_start_us_ = 0;
-        last_bind_prompt_us_ = 0;
+        StopBindCodePrompt("bind_success_message");
         const char* success_keys[] = {"text", "message", "display_text"};
         std::string success_text = FirstJsonString(root, success_keys, sizeof(success_keys) / sizeof(success_keys[0]));
         if (success_text.empty()) {
@@ -1099,6 +1106,17 @@ void BochainBypassClient::RestartBindCodePromptWindow() {
     int64_t now = esp_timer_get_time();
     bind_prompt_window_start_us_ = now;
     last_bind_prompt_us_ = 0;
+    last_bind_status_refresh_us_ = 0;
+}
+
+void BochainBypassClient::StopBindCodePrompt(const char* source) {
+    ESP_LOGI(TAG, "Stop BoChain bind code prompt, source=%s", source ? source : "unknown");
+    bind_status_ = 1;
+    latest_bind_code_.clear();
+    latest_bind_prompt_.clear();
+    bind_prompt_window_start_us_ = 0;
+    last_bind_prompt_us_ = 0;
+    last_bind_status_refresh_us_ = 0;
 }
 
 void BochainBypassClient::InterruptXiaozhiForBochainPush(const char* source) {
@@ -1120,6 +1138,7 @@ void BochainBypassClient::MaybeRepeatBindCodePrompt() {
     int64_t now = esp_timer_get_time();
     const int64_t window_us = 180LL * 1000 * 1000;
     const int64_t interval_us = 5LL * 1000 * 1000;
+    const int64_t status_refresh_interval_us = 10LL * 1000 * 1000;
 
     if (bind_prompt_window_start_us_ == 0) {
         RestartBindCodePromptWindow();
@@ -1127,6 +1146,16 @@ void BochainBypassClient::MaybeRepeatBindCodePrompt() {
 
     if ((now - bind_prompt_window_start_us_) > window_us) {
         return;
+    }
+
+    // 关键保险：后台绑定成功但 WebSocket 成功消息没推到设备时，设备要主动核验注册接口。
+    // 只要接口返回 bind_status != 0，StopBindCodePrompt 会立刻清空绑定码并停止后续播报。
+    if (last_bind_status_refresh_us_ == 0 || (now - last_bind_status_refresh_us_) >= status_refresh_interval_us) {
+        last_bind_status_refresh_us_ = now;
+        RegisterWithLiveConsole();
+        if (bind_status_ != 0 || latest_bind_code_.empty()) {
+            return;
+        }
     }
 
     if (last_bind_prompt_us_ != 0 && (now - last_bind_prompt_us_) < interval_us) {

@@ -41,6 +41,7 @@ private:
     std::string BuildAuthenticatedWsUrl(const std::string& base_url) const;
     void MaybeRepeatBindCodePrompt();
     void RestartBindCodePromptWindow();
+    void StopBindCodePrompt(const char* source);
     void InterruptXiaozhiForBochainPush(const char* source);
 	void HandleTextMessage(const char* data, size_t len);
 	void HandleBinaryMessage(const char* data, size_t len);

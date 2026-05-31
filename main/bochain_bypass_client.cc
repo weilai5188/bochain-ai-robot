@@ -525,14 +525,37 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
         if (cJSON_IsObject(action)) {
             const char* action_keys[] = {"actionType", "action_type", "type", "command", "cmd"};
             std::string action_type = FirstJsonString(action, action_keys, sizeof(action_keys) / sizeof(action_keys[0]));
-            if (action_type == "play_audio_url" || action_type == "play_remote_audio" || action_type == "play_audio") {
+            const char* action_bind_code_keys[] = {"bind_code", "bindCode", "code"};
+            std::string action_bind_code = FirstJsonString(action, action_bind_code_keys, sizeof(action_bind_code_keys) / sizeof(action_bind_code_keys[0]));
+            cJSON* action_bochain_bind = cJSON_GetObjectItem(action, "bochain_bind_code");
+            cJSON* action_support_bind = cJSON_GetObjectItem(action, "support_bind_code");
+            bool is_bind_code_action =
+                action_type == "bind_code" ||
+                action_type == "bind_code_refreshed" ||
+                action_type == "refresh_bind_code" ||
+                action_type == "unbound" ||
+                (cJSON_IsTrue(action_bochain_bind) && !action_bind_code.empty()) ||
+                (cJSON_IsTrue(action_support_bind) && !action_bind_code.empty());
+
+            if (is_bind_code_action) {
+                HandleBindCodeMessage(action);
+                if (!latest_bind_code_.empty()) {
+                    RestartBindCodePromptWindow();
+                    if (Application::GetInstance().GetDeviceState() != kDeviceStateActivating) {
+                        ShowBindCode(true, "live_console_action_bind_code");
+                    }
+                    SendAck(action_type.empty() ? "bind_code" : action_type.c_str(), "ok", latest_bind_code_);
+                } else {
+                    SendAck(action_type.empty() ? "bind_code" : action_type.c_str(), "empty", "no bind code");
+                }
+            } else if (action_type == "play_audio_url" || action_type == "play_remote_audio" || action_type == "play_audio") {
                 HandlePlayAudioMessage(action);
             } else if (action_type == "stop_audio" || action_type == "stop_current_audio" || action_type == "clear_audio_queue") {
                 HandleStopAudioMessage(action);
             } else if (action_type == "clear_play_status") {
                 DisplayBypassText("播放状态已清除", 3000);
                 SendAck("clear_play_status", "ok", "status cleared");
-            } else if (action_type == "speak" || action_type == "display" || action_type == "text" || action_type == "banner") {
+            } else if (action_type == "speak" || action_type == "speak_text" || action_type == "display" || action_type == "text" || action_type == "banner") {
                 const char* keys[] = {"text", "display_text", "speak_text", "message", "content", "title"};
                 std::string text = FirstJsonString(action, keys, sizeof(keys) / sizeof(keys[0]));
                 if (!text.empty()) HandleSpeakText(text);

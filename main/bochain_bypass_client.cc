@@ -197,9 +197,12 @@ std::string BochainBypassClient::BuildAuthenticatedWsUrl(const std::string& base
 
 
 bool BochainBypassClient::RegisterWithLiveConsole() {
-    if (!token_.empty() && token_ != LEGACY_BOCHAIN_TOKEN) {
-        return true;
-    }
+    // 不能因为本地已有 token 就直接返回。
+    // 这里同时承担“注册/续 token”和“刷新后台绑定状态”的职责：
+    // 1. 已有 token 的设备重启后，也要重新向后台查询是否未绑定、是否有新绑定码；
+    // 2. 后台绑定成功但 WebSocket 推送丢失时，也靠这里轮询后停止绑定码播报；
+    // 3. 后台解绑后重新生成绑定码，设备也能在下一次轮询拿到并播报。
+    const bool had_valid_token = !token_.empty() && token_ != LEGACY_BOCHAIN_TOKEN;
 
     auto network = Board::GetInstance().GetNetwork();
     if (network == nullptr) {
@@ -286,8 +289,13 @@ bool BochainBypassClient::RegisterWithLiveConsole() {
     cJSON_Delete(json);
 
     if (new_token.empty()) {
-        ESP_LOGE(TAG, "Register ok but device_token missing");
-        return false;
+        if (had_valid_token) {
+            // 兼容后台只返回绑定状态、不返回 token 的情况。
+            new_token = token_;
+        } else {
+            ESP_LOGE(TAG, "Register ok but device_token missing");
+            return false;
+        }
     }
 
     token_ = new_token;
@@ -298,34 +306,28 @@ bool BochainBypassClient::RegisterWithLiveConsole() {
     // 3. 只要接口仍返回 bind_code，就说明铂链设备还未绑定，不能停止播报。
     // 4. 接口不再返回 bind_code 时，才认为铂链后台已绑定，停止播报。
     if (!bind_code.empty()) {
+        // 后台返回绑定码，代表铂链后台仍处于“待绑定”状态。
+        // 只要设备不在小智官方激活中，就启动铂链绑定码播报窗口；
+        // 如果还在 activating，就先缓存，等轮询发现状态退出后再播，避免抢小智官方绑定码。
         bool is_new_bind_code = latest_bind_code_ != bind_code;
         latest_bind_code_ = bind_code;
         latest_bind_prompt_ = "铂链直播助手绑定码是" + bind_code;
+        bind_status_ = 0;
 
-        if (bind_status != 0) {
-            bind_status_ = 0;  // 铂链仍未绑定，继续播我们的码
-            if (is_new_bind_code || bind_prompt_window_start_us_ == 0) {
-                RestartBindCodePromptWindow();
-                ShowBindCode(speak_bind_code_, "register_after_xiaozhi_bound");
-            }
-        } else {
-            // 小智还没绑定/激活，只缓存铂链码，不播报，避免和小智官方码打架。
-            bind_status_ = 0;
+        if (Application::GetInstance().GetDeviceState() == kDeviceStateActivating) {
             bind_prompt_window_start_us_ = 0;
             last_bind_prompt_us_ = 0;
-            last_bind_status_refresh_us_ = 0;
-            ESP_LOGI(TAG, "BoChain bind code cached, wait Xiaozhi bound before speaking");
+            ESP_LOGI(TAG, "BoChain bind code cached while Xiaozhi activating");
+        } else if (is_new_bind_code || bind_prompt_window_start_us_ == 0) {
+            RestartBindCodePromptWindow();
+            ShowBindCode(speak_bind_code_, "register_bind_code_available");
         }
     } else {
-        // 如果之前已经拿到过铂链绑定码，但本次 register 不再返回 bind_code，
-        // 说明铂链后台大概率已完成绑定或已清除待绑定码，必须停止播报。
-        if (!latest_bind_code_.empty()) {
-            StopBindCodePrompt("register_no_bind_code_stop");
-        } else {
-            bind_status_ = bind_status;
-            if (bind_status_ != 0) {
-                StopBindCodePrompt("register_bound_status_no_bind_code");
-            }
+        // 如果后台没有返回绑定码，并且 bind_status 已经是已绑定，必须停止播报。
+        // 这样即使 WebSocket 的绑定成功信号漏掉，也能靠轮询自动收口。
+        bind_status_ = bind_status;
+        if (bind_status_ != 0 || !latest_bind_code_.empty()) {
+            StopBindCodePrompt(bind_status_ != 0 ? "register_bound_status" : "register_no_bind_code_stop");
         }
     }
 
@@ -529,6 +531,17 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
             std::string action_bind_code = FirstJsonString(action, action_bind_code_keys, sizeof(action_bind_code_keys) / sizeof(action_bind_code_keys[0]));
             cJSON* action_bochain_bind = cJSON_GetObjectItem(action, "bochain_bind_code");
             cJSON* action_support_bind = cJSON_GetObjectItem(action, "support_bind_code");
+            cJSON* action_bind_status = cJSON_GetObjectItem(action, "bind_status");
+
+            bool is_bind_success_action =
+                action_type == "bind_success" ||
+                action_type == "bound" ||
+                action_type == "bochain_bind_success" ||
+                action_type == "bind_user_changed" ||
+                action_type == "device_bound" ||
+                action_type == "bind_completed" ||
+                (cJSON_IsNumber(action_bind_status) && action_bind_status->valueint != 0 && action_bind_code.empty());
+
             bool is_bind_code_action =
                 action_type == "bind_code" ||
                 action_type == "bind_code_refreshed" ||
@@ -537,7 +550,16 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
                 (cJSON_IsTrue(action_bochain_bind) && !action_bind_code.empty()) ||
                 (cJSON_IsTrue(action_support_bind) && !action_bind_code.empty());
 
-            if (is_bind_code_action) {
+            if (is_bind_success_action) {
+                StopBindCodePrompt("live_console_action_bind_success");
+                const char* success_keys[] = {"text", "message", "display_text", "speak_text", "content"};
+                std::string success_text = FirstJsonString(action, success_keys, sizeof(success_keys) / sizeof(success_keys[0]));
+                if (success_text.empty()) {
+                    success_text = "铂链直播助手已成功绑定，祝您使用愉快。";
+                }
+                HandleSpeakText(success_text);
+                SendAck(action_type.empty() ? "bind_success" : action_type.c_str(), "ok", success_text);
+            } else if (is_bind_code_action) {
                 HandleBindCodeMessage(action);
                 if (!latest_bind_code_.empty()) {
                     RestartBindCodePromptWindow();
@@ -588,6 +610,10 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
 
 	if (IsType(message_type, "bind_code")) {
 		HandleBindCodeMessage(root);
+        if (!latest_bind_code_.empty() && Application::GetInstance().GetDeviceState() != kDeviceStateActivating) {
+            RestartBindCodePromptWindow();
+            ShowBindCode(speak_bind_code_, "server_bind_code_message");
+        }
 	} else if (IsType(message_type, "query_bind_code")) {
 		HandleQueryBindCodeMessage(root);
 	} else if (IsType(message_type, "tts")) {
@@ -618,7 +644,7 @@ void BochainBypassClient::HandleTextMessage(const char* data, size_t len) {
         const char* success_keys[] = {"text", "message", "display_text"};
         std::string success_text = FirstJsonString(root, success_keys, sizeof(success_keys) / sizeof(success_keys[0]));
         if (success_text.empty()) {
-            success_text = "设备绑定成功，已经归属到当前账号。";
+            success_text = "铂链直播助手已成功绑定，祝您使用愉快。";
         }
         HandleSpeakText(success_text);
     } else if (IsType(message_type, "audio")) {
@@ -1077,7 +1103,7 @@ void BochainBypassClient::SendAudioStatus(bool queue_full, int drop_count, size_
 }
 
 void BochainBypassClient::HandleBindCodeMessage(cJSON* root) {
-    const char* code_keys[] = {"code", "bind_code"};
+    const char* code_keys[] = {"code", "bind_code", "bindCode"};
     std::string code;
 
     for (auto key : code_keys) {
@@ -1198,12 +1224,18 @@ void BochainBypassClient::MaybeRepeatBindCodePrompt() {
     const int64_t status_refresh_interval_us = 10LL * 1000 * 1000;
 
     if (bind_prompt_window_start_us_ == 0) {
-        // 还没等到小智绑定/激活，不启动铂链码播报窗口。
-        // 但允许每 10 秒刷新一次 register，发现小智已绑定后由 RegisterWithLiveConsole 启动播报。
-        if (last_bind_status_refresh_us_ == 0 || (now - last_bind_status_refresh_us_) >= status_refresh_interval_us) {
-            last_bind_status_refresh_us_ = now;
-            RegisterWithLiveConsole();
+        // 还在小智官方激活中时，只缓存铂链码，不抢播。
+        if (Application::GetInstance().GetDeviceState() == kDeviceStateActivating) {
+            if (last_bind_status_refresh_us_ == 0 || (now - last_bind_status_refresh_us_) >= status_refresh_interval_us) {
+                last_bind_status_refresh_us_ = now;
+                RegisterWithLiveConsole();
+            }
+            return;
         }
+
+        // 小智激活结束后，如果已经有铂链码，自动启动播报窗口。
+        RestartBindCodePromptWindow();
+        ShowBindCode(true, "auto_start_after_xiaozhi_ready");
         return;
     }
 
